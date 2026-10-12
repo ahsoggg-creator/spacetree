@@ -69,3 +69,19 @@ pub fn type_stats(tree: &Tree, root: NodeId) -> Vec<TypeStat> {
     v.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.ext.cmp(&b.ext)));
     v
 }
+
+/// 1536 -> "1.50 КБ".
+pub fn human_size(n: u64) -> String {
+    const U: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} Б")
+    } else {
+        format!("{v:.2} {}", U[i])
+    }
+}

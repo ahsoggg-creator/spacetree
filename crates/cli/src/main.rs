@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use spacetree_core::{Backend, Progress, export, scan, stats};
+use spacetree_core::{Backend, Progress, export, scan, stats, stats::human_size as human};
 
 #[derive(Parser)]
 #[command(name = "spacetree", about = "Анализатор занятого места на диске")]
@@ -44,21 +44,6 @@ impl From<BackendArg> for Backend {
             BackendArg::Walk => Backend::Walk,
             BackendArg::Mft => Backend::Mft,
         }
-    }
-}
-
-fn human(n: u64) -> String {
-    const U: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} Б")
-    } else {
-        format!("{v:.2} {}", U[i])
     }
 }
 
