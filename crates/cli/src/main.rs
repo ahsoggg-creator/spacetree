@@ -1,0 +1,133 @@
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use spacetree_core::{Backend, Progress, export, scan, stats};
+
+#[derive(Parser)]
+#[command(name = "spacetree", about = "Анализатор занятого места на диске")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Просканировать папку или диск
+    Scan {
+        /// Папка или диск (например C:\ или /home)
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+        backend: BackendArg,
+        /// Сколько крупнейших файлов вывести
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Сохранить все узлы в CSV
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Auto,
+    Walk,
+    Mft,
+}
+
+impl From<BackendArg> for Backend {
+    fn from(b: BackendArg) -> Self {
+        match b {
+            BackendArg::Auto => Backend::Auto,
+            BackendArg::Walk => Backend::Walk,
+            BackendArg::Mft => Backend::Mft,
+        }
+    }
+}
+
+fn human(n: u64) -> String {
+    const U: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} Б")
+    } else {
+        format!("{v:.2} {}", U[i])
+    }
+}
+
+/// `C:` means "current dir on C:" in Windows; the user almost surely means the root.
+fn normalize(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if cfg!(windows) && s.len() == 2 && s.ends_with(':') {
+        PathBuf::from(format!("{s}\\"))
+    } else {
+        p
+    }
+}
+
+fn main() -> ExitCode {
+    let Cmd::Scan {
+        path,
+        backend,
+        top,
+        csv,
+    } = Cli::parse().cmd;
+    let path = normalize(path);
+    let progress = Progress::default();
+    let out = match scan(&path, backend.into(), &progress) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Ошибка: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let tree = &out.tree;
+    let (size, alloc, files) = tree.root_stats();
+    println!(
+        "Бэкенд:           {} ({})",
+        out.selection.used.as_str(),
+        out.selection.reason
+    );
+    println!("Файлов:           {files}");
+    println!("Папок:            {}", tree.dir_count().saturating_sub(1));
+    println!("Размер:           {} ({size} Б)", human(size));
+    println!("Размер на диске:  {} ({alloc} Б)", human(alloc));
+    println!("Время скана:      {:.3} с", out.elapsed.as_secs_f64());
+    println!("Ошибок доступа:   {}", out.errors);
+    if out.extra_links > 0 {
+        println!("Жёстких ссылок (не учтено повторно): {}", out.extra_links);
+    }
+    for s in out.error_samples.iter().take(5) {
+        println!("  ! {s}");
+    }
+
+    if top > 0 {
+        println!("\nТоп-{top} файлов:");
+        for id in stats::top_files(tree, top) {
+            println!("{:>12}  {}", human(tree.node(id).size), tree.path(id));
+        }
+    }
+
+    if let Some(csv) = csv {
+        let res = File::create(&csv).map(BufWriter::new).and_then(|mut w| {
+            export::write_csv(tree, &mut w)?;
+            std::io::Write::flush(&mut w)
+        });
+        match res {
+            Ok(()) => println!("\nCSV: {}", csv.display()),
+            Err(e) => {
+                eprintln!("Ошибка записи CSV {}: {e}", csv.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
