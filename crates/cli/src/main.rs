@@ -33,6 +33,9 @@ enum Cmd {
         /// Найти дубликаты по содержимому (размер → хеш начала → полный хеш)
         #[arg(long)]
         dupes: bool,
+        /// Показать время по фазам сканирования
+        #[arg(long)]
+        timings: bool,
     },
 }
 
@@ -71,6 +74,7 @@ fn main() -> ExitCode {
         csv,
         cleanup,
         dupes,
+        timings,
     } = Cli::parse().cmd;
     let path = normalize(path);
     let progress = Progress::default();
@@ -97,6 +101,11 @@ fn main() -> ExitCode {
     println!("Ошибок доступа:   {}", out.errors);
     if out.extra_links > 0 {
         println!("Жёстких ссылок (не учтено повторно): {}", out.extra_links);
+    }
+    if timings {
+        for (name, d) in &out.timings {
+            println!("  {:<34}{:>9.3} с", name, d.as_secs_f64());
+        }
     }
     for s in out.error_samples.iter().take(5) {
         println!("  ! {s}");

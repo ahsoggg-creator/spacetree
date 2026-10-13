@@ -334,6 +334,7 @@ impl App {
                 error_samples: Vec::new(),
                 elapsed: Duration::from_millis(4200),
                 extra_links: 0,
+                timings: Vec::new(),
             },
             top,
             types,

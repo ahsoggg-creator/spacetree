@@ -8,9 +8,11 @@
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::time::Instant;
 
 use crate::error::ScanError;
 use crate::progress::{PHASE_BUILDING, Progress};
+use crate::scan::Timings;
 use crate::tree::{Kind, NO_PARENT, Node, Tree};
 
 const MAX_ERROR_SAMPLES: usize = 200;
@@ -79,6 +81,20 @@ pub struct WalkOutput {
     pub tree: Tree,
     pub errors: u64,
     pub error_samples: Vec<String>,
+    pub timings: Timings,
+}
+
+/// Worker threads for the walk: a spinning disk gets few (parallel listings just make the head seek back
+/// and forth), everything else — including drives whose type is unknown — gets the full set.
+fn thread_count(root: &Path) -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let full = (cores * 2).clamp(4, 32);
+    #[cfg(windows)]
+    if crate::winapi::incurs_seek_penalty(root) == Some(true) {
+        return 2;
+    }
+    let _ = root;
+    full
 }
 
 pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
@@ -88,7 +104,8 @@ pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
         return Err(ScanError::Io(format!("{}: не папка", root.display())));
     }
 
-    let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) * 2).clamp(4, 32);
+    let t_start = Instant::now();
+    let threads = thread_count(&root);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -111,7 +128,9 @@ pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
         return Err(ScanError::Cancelled);
     }
 
+    let t_walk = t_start.elapsed();
     progress.phase.store(PHASE_BUILDING, Relaxed);
+    let t_build = Instant::now();
     let total = ctx.next_id.load(Relaxed) as usize;
     let placeholder = Node::new(NO_PARENT, 0, 0, Kind::File, 0, 0);
     let root_name = root.to_string_lossy().into_owned();
@@ -133,6 +152,7 @@ pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
         tree: Tree::from_parts(nodes, names),
         errors,
         error_samples,
+        timings: vec![("обход папок", t_walk), ("построение дерева", t_build.elapsed())],
     })
 }
 

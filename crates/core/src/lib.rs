@@ -19,7 +19,7 @@ mod winapi;
 
 pub use error::ScanError;
 pub use progress::Progress;
-pub use scan::{Backend, ScanOutput, Selection, Used, drive_of_root, scan, select_backend};
+pub use scan::{Backend, ScanOutput, Selection, Timings, Used, drive_of_root, scan, select_backend};
 pub use tree::{Kind, NodeId, ROOT, Tree};
 
 /// `(total, free)` bytes of the volume that contains `path`; `None` when unknown (or not on Windows).

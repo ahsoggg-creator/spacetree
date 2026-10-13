@@ -13,7 +13,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileFullDirectoryInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
-use windows_sys::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
+use windows_sys::Win32::System::Ioctl::{
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, FSCTL_GET_NTFS_VOLUME_DATA, IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER,
+    PropertyStandardQuery, STORAGE_PROPERTY_QUERY, StorageDeviceSeekPenaltyProperty,
+};
 
 #[repr(C)]
 struct VolumeDataOut {
@@ -59,6 +62,61 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     // SAFETY: `src` is NUL-terminated; out-pointers reference live locals.
     let ok = unsafe { GetDiskFreeSpaceExW(src.as_ptr(), &mut avail, &mut total, &mut free) };
     (ok != 0 && total > 0).then_some((total, free))
+}
+
+/// Whether the drive holding `path` is a spinning disk (`Some(true)`), an SSD (`Some(false)`), or unknown
+/// (`None`: network path, no drive letter, or the device does not answer). Needs no administrator rights:
+/// the volume is opened with zero access, which is enough for a property query.
+pub fn incurs_seek_penalty(path: &Path) -> Option<bool> {
+    let s = path.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let mut it = s.chars();
+    let letter = it.next().filter(char::is_ascii_alphabetic)?;
+    if it.next() != Some(':') {
+        return None;
+    }
+    let vol: Vec<u16> = format!(r"\\.\{}:", letter.to_ascii_uppercase())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `vol` is NUL-terminated; no security attributes or template handle are passed.
+    let h = unsafe {
+        CreateFileW(
+            vol.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let h = Handle(h);
+    // SAFETY: both structures are plain-old-data; all-zero is a valid value (PropertyStandardQuery == 0).
+    let mut query: STORAGE_PROPERTY_QUERY = unsafe { std::mem::zeroed() };
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType = PropertyStandardQuery;
+    let mut out: DEVICE_SEEK_PENALTY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    // SAFETY: the pointers/sizes describe `query` and `out`, which outlive the call; the handle is valid and
+    // synchronous, so no OVERLAPPED is needed.
+    let ok = unsafe {
+        DeviceIoControl(
+            h.0,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const STORAGE_PROPERTY_QUERY as *const c_void,
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            &mut out as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR as *mut c_void,
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0 && returned as usize >= std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>())
+        .then_some(out.IncursSeekPenalty)
 }
 
 /// One entry of a directory listing; `name` is UTF-16 without terminator.

@@ -35,6 +35,9 @@ pub struct Selection {
     pub reason: String,
 }
 
+/// Wall-clock (or, where marked, per-thread) time of the phases of a scan, in order.
+pub type Timings = Vec<(&'static str, Duration)>;
+
 pub struct ScanOutput {
     pub tree: Tree,
     pub selection: Selection,
@@ -43,6 +46,7 @@ pub struct ScanOutput {
     pub elapsed: Duration,
     /// Hard-link names that were not counted (MFT only).
     pub extra_links: u64,
+    pub timings: Timings,
 }
 
 /// Drive letter if `path` is a bare volume root (`C:`, `C:\`, `\?\C:\`).
@@ -113,6 +117,7 @@ pub fn scan(path: &Path, requested: Backend, progress: &Progress) -> Result<Scan
                 error_samples: w.error_samples,
                 elapsed: start.elapsed(),
                 extra_links: 0,
+                timings: w.timings,
             })
         }
         Used::Mft => scan_mft(path, selection, progress, start),
@@ -130,6 +135,7 @@ fn scan_mft(path: &Path, selection: Selection, progress: &Progress, start: Insta
         error_samples: m.error_samples,
         elapsed: start.elapsed(),
         extra_links: m.extra_links,
+        timings: m.timings,
     })
 }
 

@@ -5,14 +5,16 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::sync::Mutex;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::sync_channel;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::mpsc::{channel, sync_channel};
+use std::time::Instant;
 
 use rayon::prelude::*;
 
 use crate::error::ScanError;
-use crate::ntfs::{self, ATTR_ATTRIBUTE_LIST, ATTR_DATA, ChunkOut, Run};
+use crate::ntfs::{self, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA, ChunkOut, Run};
 use crate::progress::{PHASE_BUILDING, Progress};
+use crate::scan::Timings;
 use crate::tree::Tree;
 use crate::winapi;
 
@@ -20,7 +22,12 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_INVALID_FUNCTION: i32 = 1;
 const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // FILE_SHARE_READ | WRITE | DELETE
 const CHUNK: u64 = 8 * 1024 * 1024;
-const RECORDS_PER_TASK: usize = 2048;
+/// Small tasks keep every core busy on each 8 MiB chunk (16 tasks per chunk at 1 KiB records).
+const RECORDS_PER_TASK: usize = 512;
+/// Buffers in flight: the reader fills up to this many chunks ahead of the parser.
+const POOL_BUFFERS: usize = 4;
+/// Runs of free records at least this long are not read; shorter ones are read through to stay sequential.
+const SKIP_GAP_BYTES: u64 = 1024 * 1024;
 const MAX_ERROR_SAMPLES: usize = 200;
 
 pub struct MftOutput {
@@ -28,6 +35,7 @@ pub struct MftOutput {
     pub errors: u64,
     pub error_samples: Vec<String>,
     pub extra_links: u64,
+    pub timings: Timings,
 }
 
 pub struct VolumeInfo {
@@ -124,7 +132,10 @@ fn data_extents(attr: &[u8]) -> Result<(Vec<Run>, u64), ScanError> {
 }
 
 /// Reads record 0 ($MFT itself) and returns the extents of its $DATA stream and its real size.
-fn mft_extents(file: &File, info: &VolumeInfo) -> Result<(Vec<Run>, u64), ScanError> {
+/// Extents of `$MFT`'s data, its real size, and the in-use bitmap when it could be read.
+type MftLayout = (Vec<Run>, u64, Option<Vec<u8>>);
+
+fn mft_extents(file: &File, info: &VolumeInfo) -> Result<MftLayout, ScanError> {
     let bpc = info.bytes_per_cluster;
     let rs = info.record_size;
     let mut block = vec![0u8; rs.max(4096)];
@@ -167,16 +178,72 @@ fn mft_extents(file: &File, info: &VolumeInfo) -> Result<(Vec<Run>, u64), ScanEr
         }
         runs.sort_by_key(|r| r.vcn);
     }
-    Ok((runs, real_size))
+    runs.sort_by_key(|r| r.vcn);
+    let bitmap = read_bitmap(file, rec0, bpc);
+    Ok((runs, real_size, bitmap))
+}
+
+/// `$MFT`'s own `$BITMAP`: one bit per record, set when the record is in use. `None` when it cannot be read
+/// (the scan then simply reads every record).
+fn read_bitmap(file: &File, rec0: &[u8], bpc: u64) -> Option<Vec<u8>> {
+    const MAX_BITMAP: u64 = 256 * 1024 * 1024;
+    let attr = ntfs::find_attr(rec0, ATTR_BITMAP)?;
+    if attr.len() < 0x18 {
+        return None;
+    }
+    if attr[8] == 0 {
+        let clen = u32::from_le_bytes(attr[0x10..0x14].try_into().unwrap()) as usize;
+        let coff = u16::from_le_bytes([attr[0x14], attr[0x15]]) as usize;
+        return attr.get(coff..coff.checked_add(clen)?).map(<[u8]>::to_vec);
+    }
+    let (runs, real) = data_extents(attr).ok()?;
+    if real == 0 || real > MAX_BITMAP {
+        return None;
+    }
+    // the bitmap lives in clusters of its own: `runs` here are its runs, not those of $DATA
+    let mut buf = vec![0u8; real as usize];
+    read_virtual(file, &runs, bpc, 0, &mut buf).ok()?;
+    Some(buf)
+}
+
+/// `(first record, count)` ranges worth reading. Free stretches of at least `gap` records are skipped.
+fn used_ranges(bitmap: Option<&[u8]>, total: u64, gap: u64) -> Vec<(u64, u64)> {
+    let Some(bm) = bitmap else {
+        return vec![(0, total)];
+    };
+    // Records past the end of the bitmap are treated as in use (read them rather than lose files).
+    let used = |i: u64| bm.get((i / 8) as usize).is_none_or(|b| b >> (i % 8) & 1 != 0);
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut i = 0u64;
+    while i < total {
+        if !used(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1; // one past the last used record seen
+        i += 1;
+        while i < total && i - end < gap {
+            if used(i) {
+                end = i + 1;
+            }
+            i += 1;
+        }
+        out.push((start, end - start));
+    }
+    out
 }
 
 pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
+    let t0 = Instant::now();
     let (file, info) = probe(drive)?;
-    let (runs, real_size) = mft_extents(&file, &info)?;
+    let (runs, real_size, bitmap) = mft_extents(&file, &info)?;
     let (bpc, rs) = (info.bytes_per_cluster, info.record_size);
-    let alloc_total: u64 = runs.iter().map(|r| r.len).sum::<u64>() * bpc;
     let total_records = real_size / rs as u64;
-    progress.total_units.store(total_records, Relaxed);
+    let ranges = used_ranges(bitmap.as_deref(), total_records, SKIP_GAP_BYTES / rs as u64);
+    let to_read: u64 = ranges.iter().map(|r| r.1).sum();
+    progress.total_units.store(to_read, Relaxed);
+    let t_extents = t0.elapsed();
 
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let note = |msg: String| {
@@ -187,33 +254,49 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
         }
     };
 
-    let (tx, rx) = sync_channel::<(u64, Vec<u8>)>(3);
+    let t1 = Instant::now();
+    let (read_ns, parse_ns) = (AtomicU64::new(0), AtomicU64::new(0));
+    let per_chunk = (CHUNK / rs as u64).max(1);
+    // Chunk buffers circulate: the parser hands each one back to the reader once it is done with it.
+    let (tx, rx) = sync_channel::<(u64, usize, Vec<u8>)>(POOL_BUFFERS);
+    let (pool_tx, pool_rx) = channel::<Vec<u8>>();
+    for _ in 0..POOL_BUFFERS {
+        let _ = pool_tx.send(vec![0u8; (per_chunk as usize) * rs]);
+    }
     let mut outs: Vec<ChunkOut> = Vec::new();
     std::thread::scope(|s| {
-        s.spawn(|| {
-            let mut voff = 0u64;
-            while voff < real_size && !progress.is_cancelled() {
-                let n = CHUNK.min(alloc_total - voff);
-                let mut buf = vec![0u8; n as usize];
-                if let Err(e) = read_virtual(&file, &runs, bpc, voff, &mut buf) {
-                    note(format!("чтение $MFT по смещению {voff}: {e}"));
-                    buf.fill(0);
+        let (file, runs, ranges, note, read_ns) = (&file, &runs, &ranges, &note, &read_ns);
+        s.spawn(move || {
+            'ranges: for &(start, count) in ranges {
+                let (mut pos, end) = (start, start + count);
+                while pos < end {
+                    if progress.is_cancelled() {
+                        break 'ranges;
+                    }
+                    let Ok(mut buf) = pool_rx.recv() else { break 'ranges };
+                    let n = per_chunk.min(end - pos);
+                    let slice = &mut buf[..n as usize * rs];
+                    let t = Instant::now();
+                    if let Err(e) = read_virtual(file, runs, bpc, pos * rs as u64, slice) {
+                        note(format!("чтение $MFT, запись {pos}: {e}"));
+                        slice.fill(0);
+                    }
+                    read_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                    if tx.send((pos, n as usize, buf)).is_err() {
+                        break 'ranges;
+                    }
+                    pos += n;
                 }
-                if tx.send((voff / rs as u64, buf)).is_err() {
-                    break;
-                }
-                voff += n;
             }
             drop(tx); // closes the channel so the consumer loop ends
         });
-        for (first, mut buf) in rx {
+        for (first, n, mut buf) in rx {
             if progress.is_cancelled() {
                 break; // dropping `rx` stops the reader
             }
-            let valid = ((total_records - first) as usize).min(buf.len() / rs);
-            let task = RECORDS_PER_TASK * rs;
-            let parsed: Vec<ChunkOut> = buf[..valid * rs]
-                .par_chunks_mut(task)
+            let t = Instant::now();
+            let parsed: Vec<ChunkOut> = buf[..n * rs]
+                .par_chunks_mut(RECORDS_PER_TASK * rs)
                 .enumerate()
                 .map(|(i, part)| {
                     let mut out = ChunkOut::default();
@@ -224,22 +307,61 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
                     out
                 })
                 .collect();
+            parse_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
             let named = parsed.iter().map(|c| c.bases.len() as u64).sum::<u64>();
             progress.files.fetch_add(named, Relaxed);
-            progress.done_units.fetch_add(valid as u64, Relaxed);
+            progress.done_units.fetch_add(n as u64, Relaxed);
             outs.extend(parsed);
+            let _ = pool_tx.send(buf);
         }
+        drop(pool_tx); // unblocks the reader if the consumer stopped early
     });
     if progress.is_cancelled() {
         return Err(ScanError::Cancelled);
     }
+    let t_pipeline = t1.elapsed();
 
     progress.phase.store(PHASE_BUILDING, Relaxed);
+    let t2 = Instant::now();
     let built = ntfs::build_tree(outs, &format!("{drive}:\\"))?;
+    let timings: Timings = vec![
+        ("экстенты $MFT и битовая карта", t_extents),
+        ("чтение и разбор (конвейер)", t_pipeline),
+        ("  из них чтение (поток)", std::time::Duration::from_nanos(read_ns.load(Relaxed))),
+        ("  из них разбор (поток)", std::time::Duration::from_nanos(parse_ns.load(Relaxed))),
+        ("построение дерева", t2.elapsed()),
+    ];
     Ok(MftOutput {
         tree: built.tree,
         errors: progress.errors.load(Relaxed),
         error_samples: errors.into_inner().unwrap(),
         extra_links: built.extra_links,
+        timings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::used_ranges;
+
+    #[test]
+    fn no_bitmap_reads_everything() {
+        assert_eq!(used_ranges(None, 100, 8), vec![(0, 100)]);
+    }
+
+    #[test]
+    fn skips_long_gaps_and_bridges_short_ones() {
+        // records: 0-1 used, 2-3 free (short gap), 4 used, 5..=20 free (long), 21 used
+        let mut bm = vec![0u8; 4];
+        for i in [0u32, 1, 4, 21] {
+            bm[(i / 8) as usize] |= 1 << (i % 8);
+        }
+        assert_eq!(used_ranges(Some(&bm), 24, 8), vec![(0, 5), (21, 1)]);
+    }
+
+    #[test]
+    fn records_past_the_bitmap_are_read() {
+        let bm = [0b1u8];
+        assert_eq!(used_ranges(Some(&bm), 20, 4), vec![(0, 1), (8, 12)]);
+    }
 }

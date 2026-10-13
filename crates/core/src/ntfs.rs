@@ -17,6 +17,7 @@ pub const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 pub const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 pub const ATTR_FILE_NAME: u32 = 0x30;
 pub const ATTR_DATA: u32 = 0x80;
+pub const ATTR_BITMAP: u32 = 0xB0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
 const FLAG_IN_USE: u16 = 0x01;
@@ -144,7 +145,8 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
 
     while off + 8 <= used {
         let ty = u32_at(buf, off);
-        if ty == ATTR_END {
+        // Attributes are stored in ascending type order; nothing after $DATA is needed.
+        if ty == ATTR_END || ty > ATTR_DATA {
             break;
         }
         let len = u32_at(buf, off + 4) as usize;

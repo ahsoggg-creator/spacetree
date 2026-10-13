@@ -567,6 +567,14 @@ impl App {
                     o.elapsed.as_secs_f32(),
                     loaded.analysis.as_secs_f32(),
                 ));
+                let phases: Vec<String> = o
+                    .timings
+                    .iter()
+                    .map(|(n, d)| format!("{}={:.2}s", n.trim(), d.as_secs_f32()))
+                    .collect();
+                if !phases.is_empty() {
+                    diag::info(format!("scan phases: {}", phases.join(", ")));
+                }
                 for sample in &o.error_samples {
                     diag::warn(format!("scan: {sample}"));
                 }
