@@ -106,6 +106,9 @@ fn main() -> ExitCode {
         for (name, d) in &out.timings {
             println!("  {:<34}{:>9.3} с", name, d.as_secs_f64());
         }
+        for n in &out.notes {
+            println!("  {n}");
+        }
     }
     for s in out.error_samples.iter().take(5) {
         println!("  ! {s}");

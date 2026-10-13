@@ -22,12 +22,20 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_INVALID_FUNCTION: i32 = 1;
 const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // FILE_SHARE_READ | WRITE | DELETE
 const CHUNK: u64 = 8 * 1024 * 1024;
-/// Small tasks keep every core busy on each 8 MiB chunk (16 tasks per chunk at 1 KiB records).
-const RECORDS_PER_TASK: usize = 512;
+/// Small tasks keep every core busy on each 8 MiB chunk (16 tasks per chunk); sized in bytes so that
+/// volumes with 4 KiB records get as many tasks as those with 1 KiB records.
+const TASK_BYTES: usize = 512 * 1024;
 /// Buffers in flight: the reader fills up to this many chunks ahead of the parser.
 const POOL_BUFFERS: usize = 4;
 /// Runs of free records at least this long are not read; shorter ones are read through to stay sequential.
-const SKIP_GAP_BYTES: u64 = 1024 * 1024;
+/// A spinning disk pays a seek for every skip, so it gets a long threshold; an SSD a short one.
+fn skip_gap_bytes(drive: char) -> u64 {
+    match crate::winapi::incurs_seek_penalty(std::path::Path::new(&format!("{drive}:\\"))) {
+        Some(true) => 1024 * 1024,
+        Some(false) => 128 * 1024,
+        None => 256 * 1024,
+    }
+}
 const MAX_ERROR_SAMPLES: usize = 200;
 
 pub struct MftOutput {
@@ -36,6 +44,7 @@ pub struct MftOutput {
     pub error_samples: Vec<String>,
     pub extra_links: u64,
     pub timings: Timings,
+    pub notes: Vec<String>,
 }
 
 pub struct VolumeInfo {
@@ -200,9 +209,11 @@ fn read_bitmap(file: &File, rec0: &[u8], bpc: u64) -> Option<Vec<u8>> {
     if real == 0 || real > MAX_BITMAP {
         return None;
     }
-    // the bitmap lives in clusters of its own: `runs` here are its runs, not those of $DATA
-    let mut buf = vec![0u8; real as usize];
+    // The volume is read unbuffered, so length and offset must be sector multiples: read whole clusters
+    // (the runs cover whole clusters) and cut the tail off afterwards.
+    let mut buf = vec![0u8; real.next_multiple_of(bpc) as usize];
     read_virtual(file, &runs, bpc, 0, &mut buf).ok()?;
+    buf.truncate(real as usize);
     Some(buf)
 }
 
@@ -240,7 +251,7 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
     let (runs, real_size, bitmap) = mft_extents(&file, &info)?;
     let (bpc, rs) = (info.bytes_per_cluster, info.record_size);
     let total_records = real_size / rs as u64;
-    let ranges = used_ranges(bitmap.as_deref(), total_records, SKIP_GAP_BYTES / rs as u64);
+    let ranges = used_ranges(bitmap.as_deref(), total_records, skip_gap_bytes(drive) / rs as u64);
     let to_read: u64 = ranges.iter().map(|r| r.1).sum();
     progress.total_units.store(to_read, Relaxed);
     let t_extents = t0.elapsed();
@@ -256,6 +267,7 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
 
     let t1 = Instant::now();
     let (read_ns, parse_ns) = (AtomicU64::new(0), AtomicU64::new(0));
+    let per_task = (TASK_BYTES / rs).max(1);
     let per_chunk = (CHUNK / rs as u64).max(1);
     // Chunk buffers circulate: the parser hands each one back to the reader once it is done with it.
     let (tx, rx) = sync_channel::<(u64, usize, Vec<u8>)>(POOL_BUFFERS);
@@ -296,11 +308,11 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
             }
             let t = Instant::now();
             let parsed: Vec<ChunkOut> = buf[..n * rs]
-                .par_chunks_mut(RECORDS_PER_TASK * rs)
+                .par_chunks_mut(per_task * rs)
                 .enumerate()
                 .map(|(i, part)| {
                     let mut out = ChunkOut::default();
-                    let base = first + (i * RECORDS_PER_TASK) as u64;
+                    let base = first + (i * per_task) as u64;
                     for (j, rec) in part.chunks_exact_mut(rs).enumerate() {
                         ntfs::parse_record(rec, (base + j as u64) as u32, &mut out);
                     }
@@ -331,8 +343,19 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
         ("  из них разбор (поток)", std::time::Duration::from_nanos(parse_ns.load(Relaxed))),
         ("построение дерева", t2.elapsed()),
     ];
+    let mb = |records: u64| (records * rs as u64) as f64 / 1e6;
+    let read_s = read_ns.load(Relaxed) as f64 / 1e9;
+    let notes = vec![format!(
+        "битовая карта $MFT: {}; записей всего {total_records}, прочитано {to_read} ({:.0} МБ из {:.0} МБ), пропущено {}; чтение {:.0} МБ/с",
+        if bitmap.is_some() { "прочитана" } else { "НЕ прочитана — читаются все записи" },
+        mb(to_read),
+        mb(total_records),
+        total_records - to_read,
+        if read_s > 0.0 { mb(to_read) / read_s } else { 0.0 },
+    )];
     Ok(MftOutput {
         tree: built.tree,
+        notes,
         errors: progress.errors.load(Relaxed),
         error_samples: errors.into_inner().unwrap(),
         extra_links: built.extra_links,

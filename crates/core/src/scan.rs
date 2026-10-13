@@ -47,6 +47,8 @@ pub struct ScanOutput {
     /// Hard-link names that were not counted (MFT only).
     pub extra_links: u64,
     pub timings: Timings,
+    /// Backend remarks for diagnostics (what was skipped, read speed, ...).
+    pub notes: Vec<String>,
 }
 
 /// Drive letter if `path` is a bare volume root (`C:`, `C:\`, `\?\C:\`).
@@ -118,6 +120,7 @@ pub fn scan(path: &Path, requested: Backend, progress: &Progress) -> Result<Scan
                 elapsed: start.elapsed(),
                 extra_links: 0,
                 timings: w.timings,
+                notes: Vec::new(),
             })
         }
         Used::Mft => scan_mft(path, selection, progress, start),
@@ -136,6 +139,7 @@ fn scan_mft(path: &Path, selection: Selection, progress: &Progress, start: Insta
         elapsed: start.elapsed(),
         extra_links: m.extra_links,
         timings: m.timings,
+        notes: m.notes,
     })
 }
 

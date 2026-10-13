@@ -335,6 +335,7 @@ impl App {
                 elapsed: Duration::from_millis(4200),
                 extra_links: 0,
                 timings: Vec::new(),
+                notes: Vec::new(),
             },
             top,
             types,

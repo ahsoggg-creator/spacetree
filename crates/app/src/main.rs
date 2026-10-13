@@ -575,6 +575,9 @@ impl App {
                 if !phases.is_empty() {
                     diag::info(format!("scan phases: {}", phases.join(", ")));
                 }
+                for note in &o.notes {
+                    diag::info(format!("scan: {note}"));
+                }
                 for sample in &o.error_samples {
                     diag::warn(format!("scan: {sample}"));
                 }
