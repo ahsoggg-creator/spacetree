@@ -58,6 +58,14 @@ struct App {
     scroll_to: Option<usize>,
     tm: Option<TmCache>,
     colors: HashMap<String, Color32>,
+    /// Extension picked in the types tab; other files are dimmed in the treemap.
+    highlight_ext: Option<String>,
+}
+
+/// Scales the RGB channels of a color (`f` > 1 lightens, < 1 darkens).
+fn shade(c: Color32, f: f32) -> Color32 {
+    let m = |v: u8| (v as f32 * f).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
 }
 
 fn list_drives() -> Vec<String> {
@@ -91,6 +99,7 @@ impl App {
             scroll_to: None,
             tm: None,
             colors: HashMap::new(),
+            highlight_ext: None,
         }
     }
 
@@ -160,21 +169,34 @@ impl App {
 
     /// Selects a node everywhere: expands its ancestors, points the treemap at its folder, scrolls the tree.
     fn select(&mut self, id: NodeId) {
+        self.select_keep_view(id);
         let Some(data) = &self.data else { return };
         let tree = &data.out.tree;
-        for a in tree.ancestors(id) {
-            if a != id {
-                self.expanded.insert(a);
-            }
-        }
         self.tm_root = if tree.is_dir(id) {
             id
         } else {
             tree.parent(id).unwrap_or(ROOT)
         };
+    }
+
+    /// Like `select`, but leaves the treemap where it is.
+    fn select_keep_view(&mut self, id: NodeId) {
+        let Some(data) = &self.data else { return };
+        for a in data.out.tree.ancestors(id) {
+            if a != id {
+                self.expanded.insert(a);
+            }
+        }
         self.selected = Some(id);
         self.rebuild_rows();
         self.scroll_to = self.rows.iter().position(|&(r, _)| r == id);
+    }
+
+    fn tm_up(&mut self) {
+        let Some(data) = &self.data else { return };
+        if self.tm_root != ROOT {
+            self.tm_root = data.out.tree.parent(self.tm_root).unwrap_or(ROOT);
+        }
     }
 
     fn color_for(&mut self, ext: &str) -> Color32 {
@@ -457,19 +479,39 @@ impl App {
     fn treemap_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
-        ui.horizontal(|ui| {
+        let mut goto: Option<NodeId> = None;
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.tm_root != ROOT, egui::Button::new("↑ Вверх"))
                 .clicked()
             {
-                self.tm_root = tree.parent(self.tm_root).unwrap_or(ROOT);
+                self.tm_up();
             }
-            ui.label(format!(
-                "{} — {}",
-                tree.path(self.tm_root),
-                human_size(tree.node(self.tm_root).size)
-            ));
+            // Breadcrumbs: every ancestor of the current folder is a link.
+            let crumbs = tree.ancestors(self.tm_root);
+            for (i, &c) in crumbs.iter().enumerate() {
+                if i > 0 {
+                    ui.label("›");
+                }
+                let name = if c == ROOT {
+                    tree.path(ROOT)
+                } else {
+                    tree.name(c).to_owned()
+                };
+                if ui.link(name).clicked() {
+                    goto = Some(c);
+                }
+            }
+            ui.label(format!("— {}", human_size(tree.node(self.tm_root).size)));
+            if let Some(ext) = self.highlight_ext.clone()
+                && ui.small_button(format!("✕ .{ext}")).clicked()
+            {
+                self.highlight_ext = None;
+            }
         });
+        if let Some(c) = goto {
+            self.tm_root = c;
+        }
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click());
         let area = resp.rect;
         painter.rect_filled(area, 0.0, Color32::from_gray(24));
@@ -487,66 +529,93 @@ impl App {
         }
         let cache = self.tm.take().unwrap();
         let off = area.min.to_vec2();
-        let sel_color = Color32::WHITE;
-        let mut hover: Option<NodeId> = None;
-        if let Some(p) = resp.hover_pos() {
-            hover = treemap::hit(&cache.rects, p - off).map(|r| r.id);
-        }
+        let hover = resp
+            .hover_pos()
+            .and_then(|p| treemap::hit(&cache.rects, p - off))
+            .map(|r| r.id);
+
+        // All leaf tiles go into one mesh with a light-to-dark diagonal gradient.
+        let mut mesh = egui::Mesh::default();
+        let mut labels: Vec<(Rect, NodeId, bool)> = Vec::new();
         for r in &cache.rects {
             let rect = r.rect.translate(off);
             if r.nested {
                 painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(70)), StrokeKind::Inside);
+                if r.header {
+                    labels.push((rect, r.id, true));
+                }
                 continue;
             }
-            let ext = if tree.is_dir(r.id) {
-                "\u{0}dir".to_owned()
+            let (base, ext) = if tree.is_dir(r.id) {
+                (Color32::from_rgb(70, 80, 100), String::new())
             } else {
-                extension(tree.name(r.id))
+                let ext = extension(tree.name(r.id));
+                (self.color_for(&ext), ext)
             };
-            let col = if ext == "\u{0}dir" {
-                Color32::from_rgb(70, 80, 100)
-            } else {
-                self.color_for(&ext)
-            };
-            painter.rect_filled(rect.shrink(0.5), 0.0, col);
+            let dim = self.highlight_ext.as_ref().is_some_and(|h| *h != ext);
+            let base = if dim { shade(base, 0.35) } else { base };
+            let t = rect.shrink(0.5);
+            let (c0, c1, c2) = (shade(base, 1.18), shade(base, 0.72), shade(base, 0.95));
+            let i = mesh.vertices.len() as u32;
+            mesh.colored_vertex(t.left_top(), c0);
+            mesh.colored_vertex(t.right_top(), c2);
+            mesh.colored_vertex(t.right_bottom(), c1);
+            mesh.colored_vertex(t.left_bottom(), c2);
+            mesh.add_triangle(i, i + 1, i + 2);
+            mesh.add_triangle(i, i + 2, i + 3);
             if rect.width() > 60.0 && rect.height() > 16.0 {
-                painter.with_clip_rect(rect).text(
-                    rect.min + vec2(3.0, 2.0),
-                    Align2::LEFT_TOP,
-                    tree.name(r.id),
-                    FontId::proportional(11.0),
-                    Color32::BLACK,
-                );
+                labels.push((rect, r.id, false));
             }
         }
-        for (id, c) in [(self.selected, sel_color), (hover, Color32::YELLOW)] {
+        painter.add(Shape::mesh(mesh));
+        for (rect, id, folder) in labels {
+            let (pos, color) = if folder {
+                (rect.min + vec2(3.0, 1.0), Color32::from_gray(200))
+            } else {
+                (rect.min + vec2(3.0, 2.0), Color32::BLACK)
+            };
+            painter
+                .with_clip_rect(rect)
+                .text(pos, Align2::LEFT_TOP, tree.name(id), FontId::proportional(11.0), color);
+        }
+        for (id, c) in [(self.selected, Color32::WHITE), (hover, Color32::YELLOW)] {
             if let Some(id) = id
                 && let Some(r) = cache.rects.iter().find(|r| r.id == id)
             {
                 painter.rect_stroke(r.rect.translate(off), 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
             }
         }
+
+        let root_size = tree.node(self.tm_root).size.max(1);
         if let Some(h) = hover {
             let nd = tree.node(h);
             resp.clone().on_hover_text(format!(
-                "{}\n{} · на диске {}",
+                "{}\n{} · на диске {} · {:.1}% от текущей папки",
                 tree.path(h),
                 human_size(nd.size),
-                human_size(nd.alloc)
+                human_size(nd.alloc),
+                nd.size as f64 * 100.0 / root_size as f64
             ));
-            if resp.clicked() {
-                self.tm = Some(cache);
-                self.select(h);
-                return;
-            }
         }
         self.tm = Some(cache);
+        // Click selects, double click drills into a folder, right click / Backspace goes up.
+        if let Some(h) = hover {
+            if resp.double_clicked() && tree.is_dir(h) {
+                self.select(h);
+            } else if resp.clicked() {
+                self.select_keep_view(h);
+            }
+        }
+        if resp.secondary_clicked() || (resp.hovered() && ui.input(|i| i.key_pressed(egui::Key::Backspace))) {
+            self.tm_up();
+        }
     }
 
     fn types_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let total = data.out.tree.root_stats().0.max(1) as f64;
         let types = &data.types;
+        let mut pick_ext: Option<Option<String>> = None;
         ui.horizontal(|ui| {
             for (w, t) in [
                 (160.0, "Расширение"),
@@ -576,7 +645,15 @@ impl App {
                         } else {
                             format!(".{}", t.ext)
                         };
-                        ui.add_sized([140.0, ROW_H], egui::Label::new(name).truncate());
+                        let on = !t.ext.is_empty() && self.highlight_ext.as_deref() == Some(t.ext.as_str());
+                        if ui
+                            .add_sized([140.0, ROW_H], egui::Button::selectable(on, name))
+                            .on_hover_text("Подсветить в treemap")
+                            .clicked()
+                            && !t.ext.is_empty()
+                        {
+                            pick_ext = Some(if on { None } else { Some(t.ext.clone()) });
+                        }
                         ui.add_sized([110.0, ROW_H], egui::Label::new(human_size(t.size)));
                         ui.add_sized([110.0, ROW_H], egui::Label::new(human_size(t.alloc)));
                         ui.add_sized([90.0, ROW_H], egui::Label::new(t.count.to_string()));
@@ -587,6 +664,9 @@ impl App {
                     });
                 }
             });
+        if let Some(e) = pick_ext {
+            self.highlight_ext = e;
+        }
     }
 
     fn top_view(&mut self, ui: &mut Ui) {

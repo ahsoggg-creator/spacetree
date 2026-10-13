@@ -8,12 +8,18 @@ const MIN_AREA: f32 = 9.0;
 /// Directories get nested layout only when both sides exceed this many px.
 const MIN_NEST: f32 = 20.0;
 const PAD: f32 = 2.0;
+/// Height reserved for a folder's name above its children.
+pub const HEADER: f32 = 13.0;
+/// Minimum size of a folder frame that gets a name header.
+const MIN_HEADER: (f32, f32) = (60.0, 40.0);
 
 pub struct TmRect {
     pub id: NodeId,
     pub rect: Rect,
     /// Directory whose children are laid out inside (drawn as a frame, not filled).
     pub nested: bool,
+    /// Nested directory with room reserved for its name along the top edge.
+    pub header: bool,
 }
 
 /// Parent rectangles come before their children in the output.
@@ -37,13 +43,19 @@ fn layout_dir(tree: &Tree, id: NodeId, rect: Rect, out: &mut Vec<TmRect>) {
         .collect();
     for (c, r) in squarify(&items, rect) {
         let nest = tree.is_dir(c) && r.width() > MIN_NEST && r.height() > MIN_NEST && tree.node(c).size > 0;
+        let header = nest && r.width() > MIN_HEADER.0 && r.height() > MIN_HEADER.1;
         out.push(TmRect {
             id: c,
             rect: r,
             nested: nest,
+            header,
         });
         if nest {
-            layout_dir(tree, c, r.shrink(PAD), out);
+            let mut inner = r.shrink(PAD);
+            if header {
+                inner.min.y += HEADER;
+            }
+            layout_dir(tree, c, inner, out);
         }
     }
 }
