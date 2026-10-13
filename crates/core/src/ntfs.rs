@@ -10,6 +10,10 @@
 //! - Data runs: <https://flatcap.github.io/linux-ntfs/ntfs/concepts/data_runs.html>
 //! - $ATTRIBUTE_LIST: <https://flatcap.github.io/linux-ntfs/ntfs/attributes/attribute_list.html>
 
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+use rayon::prelude::*;
+
 use crate::error::ScanError;
 use crate::tree::{Kind, NO_PARENT, Node, ROOT, Tree};
 
@@ -363,18 +367,33 @@ const ORPHANS: &str = "[без родителя]";
 
 /// Merges parsed chunks into the final tree. `root_name` names the root directory (e.g. `C:\`).
 pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanError> {
-    let mut names = String::new();
-    let mut bases: Vec<BaseRec> = Vec::new();
-    let mut exts: Vec<ExtRec> = Vec::new();
+    // Sizes are known up front: the big vectors are allocated once instead of regrown (and copied) per chunk,
+    // and the per-chunk name offsets are shifted in parallel.
+    let mut chunks = chunks;
+    let mut shifts = Vec::with_capacity(chunks.len());
+    let (mut name_total, mut base_total, mut ext_total) = (0usize, 0usize, 0usize);
+    for c in &chunks {
+        shifts.push(name_total as u32);
+        name_total += c.names.len();
+        base_total += c.bases.len();
+        ext_total += c.exts.len();
+    }
+    chunks.par_iter_mut().zip(shifts).for_each(|(c, shift)| {
+        if shift != 0 {
+            for b in &mut c.bases {
+                b.name_off += shift;
+            }
+            for e in &mut c.exts {
+                e.name_off += shift;
+            }
+        }
+    });
+    // room for the two names appended below (root and orphan folder)
+    let mut names = String::with_capacity(name_total + 64);
+    let mut bases: Vec<BaseRec> = Vec::with_capacity(base_total);
+    let mut exts: Vec<ExtRec> = Vec::with_capacity(ext_total);
     for mut c in chunks {
-        let shift = names.len() as u32;
         names.push_str(&c.names);
-        for b in &mut c.bases {
-            b.name_off += shift;
-        }
-        for e in &mut c.exts {
-            e.name_off += shift;
-        }
         bases.append(&mut c.bases);
         exts.append(&mut c.exts);
     }
@@ -424,16 +443,17 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
     let mut nodes: Vec<Node> = Vec::with_capacity(order.len() + 1);
     nodes.push(Node::new(NO_PARENT, root_off, root_name.len() as u16, Kind::Dir, 0, 0));
     let orphan_id = order.len() as u32;
-    let mut has_orphans = false;
-    let mut extra_links = 0u64;
-    for &bi in &order[1..] {
+    let has_orphans = AtomicBool::new(false);
+    let extra_links: u64 = order[1..].par_iter().map(|&bi| bases[bi as usize].extra_links as u64).sum();
+    nodes.par_extend(order[1..].par_iter().with_min_len(8192).map(|&bi| {
         let b = &bases[bi as usize];
-        extra_links += b.extra_links as u64;
         let is_dir = b.flags & B_DIR != 0;
         let parent = match node_of.get(b.parent as usize).copied() {
             Some(p) if p != NONE && b.parent != b.rec && bases[order[p as usize] as usize].flags & B_DIR != 0 => p,
             _ => {
-                has_orphans = true;
+                if !has_orphans.load(Relaxed) {
+                    has_orphans.store(true, Relaxed);
+                }
                 orphan_id
             }
         };
@@ -441,8 +461,9 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
         let kind = if is_dir { Kind::Dir } else { Kind::File };
         let mut node = Node::new(parent, b.name_off, b.name_len, kind, size, alloc);
         node.mtime = b.mtime;
-        nodes.push(node);
-    }
+        node
+    }));
+    let has_orphans = has_orphans.into_inner();
     // The orphan node is always created so that its id (== nodes.len()) is stable; it is dropped when unused.
     if has_orphans {
         nodes.push(Node::new(ROOT, orphan_off, ORPHANS.len() as u16, Kind::Dir, 0, 0));

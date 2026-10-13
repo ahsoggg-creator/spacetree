@@ -3,6 +3,11 @@
 
 use rayon::prelude::*;
 
+/// Folders with at least this many children are sorted by gathered keys rather than through the node array.
+const KEYED_SORT_MIN: usize = 256;
+/// ... and in parallel from this many on.
+const PAR_SORT_MIN: usize = 32 * 1024;
+
 pub type NodeId = u32;
 pub const ROOT: NodeId = 0;
 pub const NO_PARENT: u32 = u32::MAX;
@@ -169,7 +174,21 @@ impl Tree {
             rest = tail;
         }
         slices.par_iter_mut().for_each(|s| {
-            s.sort_unstable_by(|&a, &b| nodes[b as usize].size.cmp(&nodes[a as usize].size).then(a.cmp(&b)));
+            if s.len() < KEYED_SORT_MIN {
+                s.sort_unstable_by(|&a, &b| nodes[b as usize].size.cmp(&nodes[a as usize].size).then(a.cmp(&b)));
+                return;
+            }
+            // Big folders: gather the keys once (the comparisons then stay in cache instead of chasing
+            // `nodes[..]` for every compare) and sort them in parallel. Order: size descending, then id.
+            let mut keyed: Vec<(u64, u32)> = s.iter().map(|&c| (u64::MAX - nodes[c as usize].size, c)).collect();
+            if keyed.len() >= PAR_SORT_MIN {
+                keyed.par_sort_unstable();
+            } else {
+                keyed.sort_unstable();
+            }
+            for (slot, (_, c)) in s.iter_mut().zip(keyed) {
+                *slot = c;
+            }
         });
     }
 
