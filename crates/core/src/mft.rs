@@ -204,6 +204,7 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
                 }
                 voff += n;
             }
+            drop(tx); // closes the channel so the consumer loop ends
         });
         for (first, mut buf) in rx {
             if progress.is_cancelled() {
