@@ -5,5 +5,9 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.36.2"
+rayon = "1.12.0"
 rfd = "0.17.2"
 spacetree-core = { version = "0.1.0", path = "../core" }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

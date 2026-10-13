@@ -211,6 +211,9 @@ mod tests {
         let sub = type_stats(&t, d);
         assert_eq!(sub.iter().map(|s| s.count).sum::<u64>(), 10_000);
         let top = top_files(&t, 3);
-        assert_eq!(top.iter().map(|&i| t.node(i).size).collect::<Vec<_>>(), vec![19_999, 19_998, 19_997]);
+        assert_eq!(
+            top.iter().map(|&i| t.node(i).size).collect::<Vec<_>>(),
+            vec![19_999, 19_998, 19_997]
+        );
     }
 }

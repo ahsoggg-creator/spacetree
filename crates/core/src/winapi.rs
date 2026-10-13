@@ -9,8 +9,8 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileFullDirectoryInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileFullDirectoryInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -162,8 +162,7 @@ fn parse_full_dir_info(b: &[u8], f: &mut impl FnMut(RawEntry)) {
                 .map(|p| u16::from_le_bytes(*p)),
         );
         let dot = u16::from(b'.');
-        let is_dot = matches!(name_buf.as_slice(), [d] | [d, _] if *d == dot)
-            && name_buf.iter().all(|&c| c == dot);
+        let is_dot = matches!(name_buf.as_slice(), [d] | [d, _] if *d == dot) && name_buf.iter().all(|&c| c == dot);
         if !is_dot {
             f(RawEntry {
                 name: &name_buf,

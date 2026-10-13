@@ -622,7 +622,11 @@ mod tests {
         // 16: dir "docs", modified 2021-01-01T00:00:00Z
         let mut si = vec![0u8; 0x30];
         si[8..16].copy_from_slice(&((1_609_459_200u64 + 11_644_473_600) * 10_000_000).to_le_bytes());
-        recs.push(record(0x03, 0, &[resident(0x10, &si), file_name_attr(root_ref, "docs", 1)]));
+        recs.push(record(
+            0x03,
+            0,
+            &[resident(0x10, &si), file_name_attr(root_ref, "docs", 1)],
+        ));
         // 17: file with DOS + Win32 names, resident data 10 bytes
         recs.push(record(
             0x01,
@@ -678,7 +682,11 @@ mod tests {
         assert_eq!(built.extra_links, 1);
         let docs = (0..t.len() as u32).find(|&i| t.name(i) == "docs").unwrap();
         assert_eq!(t.node(docs).mtime, 1_609_459_200);
-        assert_eq!(t.node(0).mtime, 1_609_459_200, "directories carry the latest mtime of their subtree");
+        assert_eq!(
+            t.node(0).mtime,
+            1_609_459_200,
+            "directories carry the latest mtime of their subtree"
+        );
         let paths: Vec<String> = (0..t.len() as u32).map(|i| t.path(i)).collect();
         let sep = std::path::MAIN_SEPARATOR;
         assert!(paths.contains(&format!("X:\\docs{sep}long name ü.txt")));

@@ -1,96 +1,179 @@
-mod treemap;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, HashSet};
+mod theme;
+mod treemap;
+mod views;
+
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
-use spacetree_core::stats::{TypeStat, extension, human_size, top_files, type_stats};
-use spacetree_core::{Backend, Kind, NodeId, Progress, ROOT, ScanError, ScanOutput, export};
+use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense, Ui, vec2};
+use spacetree_core::cleanup::{self, Group};
+use spacetree_core::stats::{TypeStat, human_size, top_files, type_stats};
+use spacetree_core::{Backend, NodeId, Progress, ROOT, ScanError, ScanOutput, Used, export};
 
-const ROW_H: f32 = 20.0;
-const INDENT: f32 = 14.0;
 const TOP_N: usize = 1000;
+const SEARCH_LIMIT: usize = 5000;
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
-struct Loaded {
-    out: ScanOutput,
-    top: Vec<NodeId>,
-    types: Vec<TypeStat>,
+/// Everything computed in the background after a scan.
+pub struct Loaded {
+    pub out: ScanOutput,
+    pub top: Vec<NodeId>,
+    pub types: Vec<TypeStat>,
+    pub cleanup: Vec<Group>,
+    pub cleanup_total: u64,
+    /// `(total, free)` of the scanned volume.
+    pub disk: Option<(u64, u64)>,
+    pub analysis: Duration,
 }
 
 struct Job {
     progress: Arc<Progress>,
     rx: Receiver<Result<Loaded, ScanError>>,
     started: Instant,
+    path: String,
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab {
-    Tree,
+pub enum Tab {
+    Overview,
     Types,
     Top,
+    Cleanup,
 }
 
-struct TmCache {
-    root: NodeId,
-    size: egui::Vec2,
-    rects: Vec<treemap::TmRect>,
+#[derive(PartialEq, Clone, Copy)]
+pub enum SortKey {
+    Size,
+    Name,
+    Files,
+    Modified,
 }
 
-struct App {
+pub struct TmCache {
+    pub root: NodeId,
+    pub size: egui::Vec2,
+    pub rects: Vec<treemap::TmRect>,
+    /// Per rect: fill color and lower-cased extension ("" for folders).
+    pub colors: Vec<Color32>,
+    pub exts: Vec<String>,
+}
+
+struct DriveInfo {
+    path: String,
+    space: Option<(u64, u64)>,
+}
+
+/// Something the user asked for from a row, a tile or a context menu; applied after drawing.
+#[derive(Clone, Copy)]
+pub enum Action {
+    Select(NodeId),
+    /// Select and show in the overview tab (tree + treemap focused on its folder).
+    Show(NodeId),
+    Toggle(NodeId),
+    Reveal(NodeId),
+    Open(NodeId),
+    CopyPath(NodeId),
+}
+
+pub struct App {
     path_text: String,
-    drives: Vec<String>,
+    drives: Vec<DriveInfo>,
     backend: Backend,
+    /// Raw MFT reading works (Windows + administrator): scans of whole drives are much faster.
+    mft_ready: bool,
+    auto_scan: bool,
     job: Option<Job>,
-    data: Option<Arc<Loaded>>,
+    pub data: Option<Arc<Loaded>>,
     message: String,
     status: Arc<Mutex<String>>,
-    tab: Tab,
+    pub tab: Tab,
 
-    selected: Option<NodeId>,
-    tm_root: NodeId,
-    expanded: HashSet<NodeId>,
-    rows: Vec<(NodeId, u16)>,
-    rows_dirty: bool,
-    scroll_to: Option<usize>,
-    tm: Option<TmCache>,
-    colors: HashMap<String, Color32>,
-    /// Extension picked in the types tab; other files are dimmed in the treemap.
-    highlight_ext: Option<String>,
+    pub selected: Option<NodeId>,
+    pub tm_root: NodeId,
+    pub expanded: HashSet<NodeId>,
+    pub rows: Vec<(NodeId, u16)>,
+    pub rows_dirty: bool,
+    pub scroll_to: Option<usize>,
+    pub tm: Option<TmCache>,
+    pub tm_menu: Option<NodeId>,
+    pub highlight_ext: Option<String>,
+    pub sort: SortKey,
+    pub sort_desc: bool,
+
+    pub search: String,
+    search_done: String,
+    search_edited: Option<Instant>,
+    pub search_hits: Vec<NodeId>,
+    pub search_truncated: bool,
+
+    pub cleanup_open: HashSet<usize>,
+    pub cleanup_show: [bool; 3],
 }
 
-/// Scales the RGB channels of a color (`f` > 1 lightens, < 1 darkens).
-fn shade(c: Color32, f: f32) -> Color32 {
-    let m = |v: u8| (v as f32 * f).round().clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
-}
-
-fn list_drives() -> Vec<String> {
-    if cfg!(windows) {
+fn list_drives() -> Vec<DriveInfo> {
+    let paths: Vec<String> = if cfg!(windows) {
         ('A'..='Z')
             .map(|c| format!("{c}:\\"))
             .filter(|p| std::path::Path::new(p).exists())
             .collect()
     } else {
         vec!["/".into()]
+    };
+    paths
+        .into_iter()
+        .map(|path| DriveInfo {
+            space: spacetree_core::disk_space(std::path::Path::new(&path)),
+            path,
+        })
+        .collect()
+}
+
+fn now_unix() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
+}
+
+/// Case-insensitive substring test; `needle` must already be lower-case.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    if needle.is_ascii() {
+        let n = needle.as_bytes();
+        hay.len() >= n.len() && hay.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    } else {
+        hay.to_lowercase().contains(needle)
     }
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        theme::install(&cc.egui_ctx);
         let drives = list_drives();
+        let arg = std::env::args().nth(1);
+        let mft_ready = cfg!(windows)
+            && drives.first().is_some_and(|d| {
+                spacetree_core::select_backend(std::path::Path::new(&d.path), Backend::Auto)
+                    .is_ok_and(|s| s.used == Used::Mft)
+            });
         App {
-            path_text: drives.first().cloned().unwrap_or_default(),
+            path_text: arg
+                .clone()
+                .or_else(|| drives.first().map(|d| d.path.clone()))
+                .unwrap_or_default(),
+            auto_scan: arg.is_some(),
             drives,
             backend: Backend::Auto,
+            mft_ready,
             job: None,
             data: None,
             message: String::new(),
             status: Arc::default(),
-            tab: Tab::Tree,
+            tab: Tab::Overview,
             selected: None,
             tm_root: ROOT,
             expanded: HashSet::new(),
@@ -98,8 +181,17 @@ impl App {
             rows_dirty: false,
             scroll_to: None,
             tm: None,
-            colors: HashMap::new(),
+            tm_menu: None,
             highlight_ext: None,
+            sort: SortKey::Size,
+            sort_desc: true,
+            search: String::new(),
+            search_done: String::new(),
+            search_edited: None,
+            search_hits: Vec::new(),
+            search_truncated: false,
+            cleanup_open: HashSet::new(),
+            cleanup_show: [true; 3],
         }
     }
 
@@ -107,16 +199,33 @@ impl App {
         if self.job.is_some() {
             return;
         }
-        let path = PathBuf::from(self.path_text.trim());
+        let mut text = self.path_text.trim().to_owned();
+        if cfg!(windows) && text.len() == 2 && text.ends_with(':') {
+            text.push('\\'); // `C:` alone means "current directory on C:"
+            self.path_text = text.clone();
+        }
+        let path = PathBuf::from(&text);
         let backend = self.backend;
         let progress = Arc::new(Progress::default());
         let (tx, rx) = channel();
         let (p, ctx2) = (progress.clone(), ctx.clone());
         std::thread::spawn(move || {
             let res = spacetree_core::scan(&path, backend, &p).map(|out| {
-                let top = top_files(&out.tree, TOP_N);
-                let types = type_stats(&out.tree, ROOT);
-                Loaded { out, top, types }
+                let t = Instant::now();
+                let tree = &out.tree;
+                let ((top, types), groups) = rayon::join(
+                    || rayon::join(|| top_files(tree, TOP_N), || type_stats(tree, ROOT)),
+                    || cleanup::find(tree, now_unix()),
+                );
+                Loaded {
+                    cleanup_total: groups.iter().map(|g| g.size).sum(),
+                    cleanup: groups,
+                    top,
+                    types,
+                    disk: spacetree_core::disk_space(&path),
+                    analysis: t.elapsed(),
+                    out,
+                }
             });
             let _ = tx.send(res);
             ctx2.request_repaint();
@@ -125,6 +234,7 @@ impl App {
             progress,
             rx,
             started: Instant::now(),
+            path: text,
         });
         self.message.clear();
     }
@@ -140,6 +250,11 @@ impl App {
                 self.tm = None;
                 self.expanded = HashSet::from([ROOT]);
                 self.rows_dirty = true;
+                self.search_done.clear();
+                self.search_hits.clear();
+                self.cleanup_open.clear();
+                self.highlight_ext = None;
+                self.drives = list_drives();
             }
             Ok(Err(e)) => {
                 self.message = e.to_string();
@@ -153,22 +268,34 @@ impl App {
         }
     }
 
-    fn rebuild_rows(&mut self) {
+    pub fn rebuild_rows(&mut self) {
         self.rows.clear();
-        let Some(data) = &self.data else { return };
+        self.rows_dirty = false;
+        let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
         let mut stack = vec![(ROOT, 0u16)];
         while let Some((id, depth)) = stack.pop() {
             self.rows.push((id, depth));
             if tree.is_dir(id) && self.expanded.contains(&id) {
-                stack.extend(tree.children(id).iter().rev().map(|&c| (c, depth + 1)));
+                let mut ch = tree.children(id).to_vec(); // size, descending
+                match self.sort {
+                    SortKey::Size => {}
+                    SortKey::Name => ch.sort_by_cached_key(|&c| tree.name(c).to_lowercase()),
+                    SortKey::Files => ch.sort_by_key(|&c| std::cmp::Reverse(tree.node(c).files)),
+                    SortKey::Modified => ch.sort_by_key(|&c| std::cmp::Reverse(tree.node(c).mtime)),
+                }
+                let natural_desc = self.sort != SortKey::Name;
+                if natural_desc != self.sort_desc {
+                    ch.reverse();
+                }
+                // pushed in reverse so that the first child is popped (shown) first
+                stack.extend(ch.into_iter().rev().map(|c| (c, depth + 1)));
             }
         }
-        self.rows_dirty = false;
     }
 
     /// Selects a node everywhere: expands its ancestors, points the treemap at its folder, scrolls the tree.
-    fn select(&mut self, id: NodeId) {
+    pub fn select(&mut self, id: NodeId) {
         self.select_keep_view(id);
         let Some(data) = &self.data else { return };
         let tree = &data.out.tree;
@@ -180,8 +307,8 @@ impl App {
     }
 
     /// Like `select`, but leaves the treemap where it is.
-    fn select_keep_view(&mut self, id: NodeId) {
-        let Some(data) = &self.data else { return };
+    pub fn select_keep_view(&mut self, id: NodeId) {
+        let Some(data) = self.data.clone() else { return };
         for a in data.out.tree.ancestors(id) {
             if a != id {
                 self.expanded.insert(a);
@@ -192,537 +319,443 @@ impl App {
         self.scroll_to = self.rows.iter().position(|&(r, _)| r == id);
     }
 
-    fn tm_up(&mut self) {
+    pub fn tm_up(&mut self) {
         let Some(data) = &self.data else { return };
         if self.tm_root != ROOT {
             self.tm_root = data.out.tree.parent(self.tm_root).unwrap_or(ROOT);
         }
     }
 
-    fn color_for(&mut self, ext: &str) -> Color32 {
-        *self.colors.entry(ext.to_owned()).or_insert_with(|| {
-            let mut h: u32 = 2166136261;
-            for b in ext.bytes() {
-                h = (h ^ b as u32).wrapping_mul(16777619);
+    pub fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        let Some(data) = self.data.clone() else { return };
+        let tree = &data.out.tree;
+        match action {
+            Action::Select(id) => self.select_keep_view(id),
+            Action::Show(id) => {
+                self.tab = Tab::Overview;
+                self.select(id);
             }
-            let hue = (h % 360) as f32 / 360.0;
-            let c: egui::ecolor::Hsva = egui::ecolor::Hsva::new(hue, 0.55, 0.78, 1.0);
-            c.into()
-        })
+            Action::Toggle(id) => {
+                if !self.expanded.remove(&id) {
+                    self.expanded.insert(id);
+                }
+                self.rows_dirty = true;
+            }
+            Action::Reveal(id) => reveal(&tree.path(id)),
+            Action::Open(id) => open_path(&tree.path(id)),
+            Action::CopyPath(id) => ctx.copy_text(tree.path(id)),
+        }
     }
 
-    fn top_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
+    fn update_search(&mut self, ctx: &egui::Context) {
+        let q = self.search.trim().to_lowercase();
+        if q == self.search_done {
+            return;
+        }
+        if let Some(t) = self.search_edited
+            && t.elapsed() < SEARCH_DEBOUNCE
+        {
+            ctx.request_repaint_after(SEARCH_DEBOUNCE);
+            return;
+        }
+        self.search_done = q.clone();
+        self.search_hits.clear();
+        self.search_truncated = false;
+        let Some(data) = self.data.clone() else { return };
+        if q.is_empty() {
+            return;
+        }
+        use rayon::prelude::*;
+        let tree = &data.out.tree;
+        let mut hits: Vec<NodeId> = (1..tree.len() as NodeId)
+            .into_par_iter()
+            .filter(|&i| contains_ci(tree.name(i), &q))
+            .collect();
+        hits.par_sort_unstable_by_key(|&i| std::cmp::Reverse(tree.node(i).size));
+        self.search_truncated = hits.len() > SEARCH_LIMIT;
+        hits.truncate(SEARCH_LIMIT);
+        self.search_hits = hits;
+    }
+
+    pub fn search_active(&self) -> bool {
+        !self.search_done.is_empty()
+    }
+
+    fn export_csv(&mut self, data: Arc<Loaded>) {
+        let Some(p) = rfd::FileDialog::new().set_file_name("spacetree.csv").save_file() else {
+            return;
+        };
+        let status = self.status.clone();
+        *status.lock().unwrap() = "Экспорт CSV…".into();
+        std::thread::spawn(move || {
+            let res = std::fs::File::create(&p)
+                .map(std::io::BufWriter::new)
+                .and_then(|mut w| {
+                    export::write_csv(&data.out.tree, &mut w)?;
+                    std::io::Write::flush(&mut w)
+                });
+            *status.lock().unwrap() = match res {
+                Ok(()) => format!("CSV сохранён: {}", p.display()),
+                Err(e) => format!("Ошибка записи CSV: {e}"),
+            };
+        });
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("◼ spacetree").strong().size(16.0).color(theme::ACCENT));
+            ui.add_space(8.0);
             let scanning = self.job.is_some();
             ui.add_enabled_ui(!scanning, |ui| {
-                ui.label("Путь:");
-                ui.add(egui::TextEdit::singleline(&mut self.path_text).desired_width(280.0));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.path_text)
+                        .hint_text("Диск или папка")
+                        .desired_width(260.0),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    let ctx = ui.ctx().clone();
+                    self.start_scan(&ctx);
+                }
                 egui::ComboBox::from_id_salt("drives")
-                    .selected_text("Диск")
+                    .selected_text("Диски")
                     .show_ui(ui, |ui| {
-                        for d in self.drives.clone() {
-                            if ui.selectable_label(false, &d).clicked() {
-                                self.path_text = d;
+                        for d in &self.drives {
+                            let label = match d.space {
+                                Some((t, f)) => format!("{}   свободно {} из {}", d.path, human_size(f), human_size(t)),
+                                None => d.path.clone(),
+                            };
+                            if ui.selectable_label(false, label).clicked() {
+                                self.path_text = d.path.clone();
                             }
                         }
                     });
-                if ui.button("Папка…").clicked()
+                if ui.button("Папка…").on_hover_text("Выбрать папку").clicked()
                     && let Some(p) = rfd::FileDialog::new().pick_folder()
                 {
                     self.path_text = p.to_string_lossy().into_owned();
                 }
                 egui::ComboBox::from_id_salt("backend")
                     .selected_text(match self.backend {
-                        Backend::Auto => "auto",
-                        Backend::Walk => "walk",
-                        Backend::Mft => "mft",
+                        Backend::Auto => "Авто",
+                        Backend::Walk => "Обход папок",
+                        Backend::Mft => "MFT",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.backend, Backend::Auto, "auto");
-                        ui.selectable_value(&mut self.backend, Backend::Walk, "walk");
-                        ui.selectable_value(&mut self.backend, Backend::Mft, "mft");
-                    });
+                        ui.selectable_value(&mut self.backend, Backend::Auto, "Авто")
+                            .on_hover_text("MFT для целого NTFS-диска при правах администратора, иначе обход папок");
+                        ui.selectable_value(&mut self.backend, Backend::Walk, "Обход папок");
+                        ui.selectable_value(&mut self.backend, Backend::Mft, "MFT (только корень NTFS-диска)");
+                    })
+                    .response
+                    .on_hover_text("Способ сканирования");
             });
             if scanning {
-                if ui.button("Отмена").clicked()
+                if ui.button("⏹ Отмена").clicked()
                     && let Some(j) = &self.job
                 {
                     j.progress.cancel();
                 }
-            } else if ui.button("Сканировать").clicked() {
+            } else if theme::primary_button(ui, "▶ Сканировать").clicked() {
                 let ctx = ui.ctx().clone();
                 self.start_scan(&ctx);
             }
-            if let Some(data) = self.data.clone() {
-                if ui.button("Экспорт CSV…").clicked()
-                    && let Some(p) = rfd::FileDialog::new().set_file_name("spacetree.csv").save_file()
-                {
-                    let (status, data) = (self.status.clone(), data.clone());
-                    *status.lock().unwrap() = "Экспорт CSV…".into();
-                    std::thread::spawn(move || {
-                        let res = std::fs::File::create(&p)
-                            .map(std::io::BufWriter::new)
-                            .and_then(|mut w| {
-                                export::write_csv(&data.out.tree, &mut w)?;
-                                std::io::Write::flush(&mut w)
-                            });
-                        *status.lock().unwrap() = match res {
-                            Ok(()) => format!("CSV сохранён: {}", p.display()),
-                            Err(e) => format!("Ошибка записи CSV: {e}"),
-                        };
-                    });
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if let Some(data) = self.data.clone() {
+                    if ui.button("⬇ CSV").on_hover_text("Экспорт всего дерева в CSV").clicked() {
+                        self.export_csv(data);
+                    }
+                    let id = egui::Id::new("search");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .id(id)
+                            .hint_text("🔍 Поиск по имени (Ctrl+F)")
+                            .desired_width(220.0),
+                    );
+                    if resp.changed() {
+                        self.search_edited = Some(Instant::now());
+                        self.tab = Tab::Overview;
+                    }
+                    if ui.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
+                        resp.request_focus();
+                    }
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                        self.search.clear();
+                    }
                 }
-                #[cfg(windows)]
-                if ui
-                    .add_enabled(self.selected.is_some(), egui::Button::new("Показать в проводнике"))
-                    .clicked()
-                    && let Some(id) = self.selected
-                {
-                    use std::os::windows::process::CommandExt;
-                    let path = data.out.tree.path(id);
-                    let _ = std::process::Command::new("explorer")
-                        .raw_arg(format!("/select,\"{path}\""))
-                        .spawn();
-                }
-            }
+            });
         });
+        ui.add_space(2.0);
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if let Some(job) = &self.job {
-                let p = &job.progress;
-                let building = p.phase.load(Relaxed) == spacetree_core::progress::PHASE_BUILDING;
-                let txt = if building {
-                    "Построение дерева…"
-                } else {
-                    "Сканирование…"
-                };
-                match p.fraction() {
-                    Some(f) if !building => ui.add(egui::ProgressBar::new(f).desired_width(180.0).text(txt)),
-                    _ => ui.add(egui::ProgressBar::new(1.0).animate(true).desired_width(180.0).text(txt)),
-                };
-                ui.label(format!(
-                    "файлов: {} · {} · ошибок: {} · {:.1} с",
-                    p.files.load(Relaxed),
-                    human_size(p.bytes.load(Relaxed)),
-                    p.errors.load(Relaxed),
-                    job.started.elapsed().as_secs_f32()
-                ));
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
-            } else if let Some(d) = &self.data {
+            if let Some(d) = &self.data {
                 let (size, alloc, files) = d.out.tree.root_stats();
                 ui.label(format!(
-                    "[{}] файлов: {files} · папок: {} · размер: {} · на диске: {} · {:.2} с · ошибок доступа: {}",
-                    d.out.selection.used.as_str(),
+                    "Файлов: {files} · папок: {} · размер: {} · на диске: {}",
                     d.out.tree.dir_count().saturating_sub(1),
                     human_size(size),
                     human_size(alloc),
-                    d.out.elapsed.as_secs_f64(),
-                    d.out.errors
-                ))
-                .on_hover_text(format!(
-                    "Бэкенд: {}\n{}",
-                    d.out.selection.reason,
-                    d.out
-                        .error_samples
-                        .iter()
-                        .take(15)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
                 ));
+                ui.separator();
+                let used = match d.out.selection.used {
+                    Used::Mft => "MFT",
+                    Used::Walk => "обход папок",
+                };
+                ui.label(format!("{used} · {:.2} с", d.out.elapsed.as_secs_f64()))
+                    .on_hover_text(format!(
+                        "Способ: {}\nАнализ после сканирования: {:.2} с",
+                        d.out.selection.reason,
+                        d.analysis.as_secs_f64()
+                    ));
+                if d.out.errors > 0 {
+                    ui.separator();
+                    ui.label(RichText::new(format!("⚠ нет доступа: {}", d.out.errors)).color(theme::LIKELY))
+                        .on_hover_text(
+                            d.out
+                                .error_samples
+                                .iter()
+                                .take(20)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                }
             }
             if !self.message.is_empty() {
-                ui.colored_label(Color32::LIGHT_RED, &self.message);
+                ui.colored_label(ui.visuals().error_fg_color, &self.message);
             }
             let st = self.status.lock().unwrap().clone();
             if !st.is_empty() {
                 ui.label(st);
             }
+            if let Some((total, free)) = self.data.as_ref().and_then(|d| d.disk) {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(100.0, 8.0), Sense::hover());
+                    theme::bar(ui, r, 1.0 - free as f32 / total.max(1) as f32, theme::ACCENT);
+                    ui.label(format!("Свободно {} из {}", human_size(free), human_size(total)));
+                });
+            }
         });
     }
 
-    fn tree_view(&mut self, ui: &mut Ui) {
-        let Some(data) = self.data.clone() else { return };
-        let tree = &data.out.tree;
-        if self.rows_dirty {
-            self.rebuild_rows();
-        }
-        let width = ui.available_width();
-        let (w_size, w_pct, w_files) = (90.0, 60.0, 80.0);
-        let cols_w = w_size * 2.0 + w_pct + w_files;
-        let font = FontId::proportional(13.0);
-        let weak = ui.visuals().weak_text_color();
-        let text_col = ui.visuals().text_color();
-
-        let (hdr, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
-        let pr = ui.painter_at(hdr);
-        pr.text(
-            hdr.left_center() + vec2(4.0, 0.0),
-            Align2::LEFT_CENTER,
-            "Имя",
-            font.clone(),
-            weak,
-        );
-        let mut x = hdr.right();
-        for (w, t) in [
-            (w_files, "Файлов"),
-            (w_pct, "% родит."),
-            (w_size, "На диске"),
-            (w_size, "Размер"),
-        ] {
-            pr.text(
-                pos2(x - 6.0, hdr.center().y),
-                Align2::RIGHT_CENTER,
-                t,
-                font.clone(),
-                weak,
+    fn welcome(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.12).max(16.0));
+            ui.label(RichText::new("Что занимает место?").size(26.0).strong());
+            ui.label(
+                RichText::new("Выберите диск или папку — spacetree покажет, куда ушло место и что можно удалить.")
+                    .weak(),
             );
-            x -= w;
-        }
+        });
+        ui.add_space(20.0);
 
-        let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        if let Some(r) = self.scroll_to.take() {
-            sa = sa.vertical_scroll_offset((r as f32 * (ROW_H + ui.spacing().item_spacing.y) - 60.0).max(0.0));
-        }
-        let mut clicked: Option<NodeId> = None;
-        let mut toggled: Option<NodeId> = None;
-        sa.show_rows(ui, ROW_H, self.rows.len(), |ui, range| {
-            for i in range {
-                let (id, depth) = self.rows[i];
-                let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
-                let painter = ui.painter_at(rect);
-                let sel = self.selected == Some(id);
-                if sel {
-                    painter.rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
-                } else if resp.hovered() {
-                    painter.rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
-                }
-                let nd = tree.node(id);
-                let is_dir = nd.kind == Kind::Dir;
-                let tx = rect.left() + 4.0 + depth as f32 * INDENT;
-                if is_dir && !tree.children(id).is_empty() {
-                    let c = pos2(tx + 6.0, rect.center().y);
-                    let pts = if self.expanded.contains(&id) {
-                        vec![c + vec2(-4.0, -2.5), c + vec2(4.0, -2.5), c + vec2(0.0, 3.0)]
-                    } else {
-                        vec![c + vec2(-2.5, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.5, 4.0)]
-                    };
-                    painter.add(Shape::convex_polygon(pts, text_col, Stroke::NONE));
-                }
-                let (icon, col) = match nd.kind {
-                    Kind::Dir => ("", text_col),
-                    Kind::File => ("", text_col),
-                    Kind::Link => (" ↪", weak),
-                };
-                let name_clip = Rect::from_min_max(rect.min, pos2(rect.right() - cols_w, rect.bottom()));
-                ui.painter_at(name_clip).text(
-                    pos2(tx + 16.0, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    format!("{}{icon}", tree.name(id)),
-                    font.clone(),
-                    col,
+        // drive cards, centered, wrapping into rows
+        let (card_w, card_h, gap) = (240.0, 84.0, 12.0);
+        let avail = ui.available_width();
+        let cols = (((avail + gap) / (card_w + gap)).floor() as usize).clamp(1, self.drives.len().max(1));
+        let rows = self.drives.len().div_ceil(cols);
+        let (area, _) = ui.allocate_exact_size(vec2(avail, rows as f32 * (card_h + gap)), Sense::hover());
+        let mut chosen = None;
+        for (i, d) in self.drives.iter().enumerate() {
+            let (row, col) = (i / cols, i % cols);
+            let in_row = (self.drives.len() - row * cols).min(cols) as f32;
+            let left = area.left() + (avail - in_row * (card_w + gap) + gap) / 2.0;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    left + col as f32 * (card_w + gap),
+                    area.top() + row as f32 * (card_h + gap),
+                ),
+                vec2(card_w, card_h),
+            );
+            let resp = ui
+                .interact(rect, egui::Id::new(("drive", i)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Сканировать");
+            let v = ui.visuals();
+            let fill = if resp.hovered() {
+                v.widgets.hovered.weak_bg_fill
+            } else {
+                v.window_fill
+            };
+            let stroke = if resp.hovered() {
+                egui::Stroke::new(1.0, theme::ACCENT)
+            } else {
+                v.widgets.noninteractive.bg_stroke
+            };
+            let (text, weak) = (v.text_color(), v.weak_text_color());
+            let p = ui.painter();
+            p.rect(rect, 10.0, fill, stroke, egui::StrokeKind::Inside);
+            let inner = rect.shrink(14.0);
+            p.text(
+                inner.left_top(),
+                egui::Align2::LEFT_TOP,
+                &d.path,
+                egui::FontId::proportional(18.0),
+                text,
+            );
+            if let Some((total, free)) = d.space {
+                let frac = (total - free) as f32 / total.max(1) as f32;
+                let bar = egui::Rect::from_min_size(inner.left_top() + vec2(0.0, 28.0), vec2(inner.width(), 8.0));
+                theme::bar(ui, bar, frac, if frac > 0.9 { theme::REVIEW } else { theme::ACCENT });
+                ui.painter().text(
+                    inner.left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("свободно {} из {}", human_size(free), human_size(total)),
+                    egui::FontId::proportional(12.5),
+                    weak,
                 );
-                let parent_size = tree.parent(id).map(|p| tree.node(p).size).unwrap_or(nd.size);
-                let pct = if parent_size == 0 {
-                    0.0
-                } else {
-                    nd.size as f64 * 100.0 / parent_size as f64
-                };
-                let cells = [
-                    (w_files, if is_dir { nd.files.to_string() } else { String::new() }),
-                    (w_pct, format!("{pct:.1}%")),
-                    (w_size, human_size(nd.alloc)),
-                    (w_size, human_size(nd.size)),
-                ];
-                let mut x = rect.right();
-                for (w, t) in cells {
-                    painter.text(
-                        pos2(x - 6.0, rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        t,
-                        font.clone(),
-                        text_col,
-                    );
-                    x -= w;
-                }
-                if resp.clicked() {
-                    let on_arrow = resp.interact_pointer_pos().is_some_and(|p| p.x < tx + 14.0);
-                    if is_dir && on_arrow {
-                        toggled = Some(id);
-                    } else {
-                        clicked = Some(id);
-                    }
-                }
-                if resp.double_clicked() && is_dir {
-                    toggled = Some(id);
-                }
             }
-        });
-        if let Some(id) = toggled {
-            if !self.expanded.remove(&id) {
-                self.expanded.insert(id);
+            if resp.clicked() {
+                chosen = Some(d.path.clone());
             }
-            self.rows_dirty = true;
         }
-        if let Some(id) = clicked {
-            self.selected = Some(id);
-            self.tm_root = if tree.is_dir(id) {
-                id
-            } else {
-                tree.parent(id).unwrap_or(ROOT)
-            };
-        }
-    }
 
-    fn treemap_view(&mut self, ui: &mut Ui) {
-        let Some(data) = self.data.clone() else { return };
-        let tree = &data.out.tree;
-        let mut goto: Option<NodeId> = None;
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(self.tm_root != ROOT, egui::Button::new("↑ Вверх"))
-                .clicked()
+        ui.vertical_centered(|ui| {
+            ui.add_space(6.0);
+            if ui.button("Выбрать папку…").clicked()
+                && let Some(p) = rfd::FileDialog::new().pick_folder()
             {
-                self.tm_up();
+                chosen = Some(p.to_string_lossy().into_owned());
             }
-            // Breadcrumbs: every ancestor of the current folder is a link.
-            let crumbs = tree.ancestors(self.tm_root);
-            for (i, &c) in crumbs.iter().enumerate() {
-                if i > 0 {
-                    ui.label("›");
-                }
-                let name = if c == ROOT {
-                    tree.path(ROOT)
-                } else {
-                    tree.name(c).to_owned()
-                };
-                if ui.link(name).clicked() {
-                    goto = Some(c);
-                }
-            }
-            ui.label(format!("— {}", human_size(tree.node(self.tm_root).size)));
-            if let Some(ext) = self.highlight_ext.clone()
-                && ui.small_button(format!("✕ .{ext}")).clicked()
-            {
-                self.highlight_ext = None;
-            }
-        });
-        if let Some(c) = goto {
-            self.tm_root = c;
-        }
-        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click());
-        let area = resp.rect;
-        painter.rect_filled(area, 0.0, Color32::from_gray(24));
-        if self
-            .tm
-            .as_ref()
-            .is_none_or(|c| c.root != self.tm_root || c.size != area.size())
-        {
-            let rects = treemap::layout(tree, self.tm_root, Rect::from_min_size(Pos2::ZERO, area.size()));
-            self.tm = Some(TmCache {
-                root: self.tm_root,
-                size: area.size(),
-                rects,
-            });
-        }
-        let cache = self.tm.take().unwrap();
-        let off = area.min.to_vec2();
-        let hover = resp
-            .hover_pos()
-            .and_then(|p| treemap::hit(&cache.rects, p - off))
-            .map(|r| r.id);
-
-        // All leaf tiles go into one mesh with a light-to-dark diagonal gradient.
-        let mut mesh = egui::Mesh::default();
-        let mut labels: Vec<(Rect, NodeId, bool)> = Vec::new();
-        for r in &cache.rects {
-            let rect = r.rect.translate(off);
-            if r.nested {
-                painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(70)), StrokeKind::Inside);
-                if r.header {
-                    labels.push((rect, r.id, true));
-                }
-                continue;
-            }
-            let (base, ext) = if tree.is_dir(r.id) {
-                (Color32::from_rgb(70, 80, 100), String::new())
-            } else {
-                let ext = extension(tree.name(r.id));
-                (self.color_for(&ext), ext)
-            };
-            let dim = self.highlight_ext.as_ref().is_some_and(|h| *h != ext);
-            let base = if dim { shade(base, 0.35) } else { base };
-            let t = rect.shrink(0.5);
-            let (c0, c1, c2) = (shade(base, 1.18), shade(base, 0.72), shade(base, 0.95));
-            let i = mesh.vertices.len() as u32;
-            mesh.colored_vertex(t.left_top(), c0);
-            mesh.colored_vertex(t.right_top(), c2);
-            mesh.colored_vertex(t.right_bottom(), c1);
-            mesh.colored_vertex(t.left_bottom(), c2);
-            mesh.add_triangle(i, i + 1, i + 2);
-            mesh.add_triangle(i, i + 2, i + 3);
-            if rect.width() > 60.0 && rect.height() > 16.0 {
-                labels.push((rect, r.id, false));
-            }
-        }
-        painter.add(Shape::mesh(mesh));
-        for (rect, id, folder) in labels {
-            let (pos, color) = if folder {
-                (rect.min + vec2(3.0, 1.0), Color32::from_gray(200))
-            } else {
-                (rect.min + vec2(3.0, 2.0), Color32::BLACK)
-            };
-            painter
-                .with_clip_rect(rect)
-                .text(pos, Align2::LEFT_TOP, tree.name(id), FontId::proportional(11.0), color);
-        }
-        for (id, c) in [(self.selected, Color32::WHITE), (hover, Color32::YELLOW)] {
-            if let Some(id) = id
-                && let Some(r) = cache.rects.iter().find(|r| r.id == id)
-            {
-                painter.rect_stroke(r.rect.translate(off), 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
-            }
-        }
-
-        let root_size = tree.node(self.tm_root).size.max(1);
-        if let Some(h) = hover {
-            let nd = tree.node(h);
-            resp.clone().on_hover_text(format!(
-                "{}\n{} · на диске {} · {:.1}% от текущей папки",
-                tree.path(h),
-                human_size(nd.size),
-                human_size(nd.alloc),
-                nd.size as f64 * 100.0 / root_size as f64
-            ));
-        }
-        self.tm = Some(cache);
-        // Click selects, double click drills into a folder, right click / Backspace goes up.
-        if let Some(h) = hover {
-            if resp.double_clicked() && tree.is_dir(h) {
-                self.select(h);
-            } else if resp.clicked() {
-                self.select_keep_view(h);
-            }
-        }
-        if resp.secondary_clicked() || (resp.hovered() && ui.input(|i| i.key_pressed(egui::Key::Backspace))) {
-            self.tm_up();
-        }
-    }
-
-    fn types_view(&mut self, ui: &mut Ui) {
-        let Some(data) = self.data.clone() else { return };
-        let total = data.out.tree.root_stats().0.max(1) as f64;
-        let types = &data.types;
-        let mut pick_ext: Option<Option<String>> = None;
-        ui.horizontal(|ui| {
-            for (w, t) in [
-                (160.0, "Расширение"),
-                (110.0, "Размер"),
-                (110.0, "На диске"),
-                (90.0, "Файлов"),
-                (60.0, "%"),
-            ] {
-                ui.add_sized([w, 18.0], egui::Label::new(egui::RichText::new(t).weak()));
-            }
-        });
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, ROW_H, types.len(), |ui, range| {
-                for i in range {
-                    let t = &types[i];
-                    let col = if t.ext.is_empty() {
-                        Color32::GRAY
-                    } else {
-                        self.color_for(&t.ext)
-                    };
-                    ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-                        ui.painter().rect_filled(r, 2.0, col);
-                        let name = if t.ext.is_empty() {
-                            "(без расширения)".to_owned()
-                        } else {
-                            format!(".{}", t.ext)
-                        };
-                        let on = !t.ext.is_empty() && self.highlight_ext.as_deref() == Some(t.ext.as_str());
-                        if ui
-                            .add_sized([140.0, ROW_H], egui::Button::selectable(on, name))
-                            .on_hover_text("Подсветить в treemap")
-                            .clicked()
-                            && !t.ext.is_empty()
-                        {
-                            pick_ext = Some(if on { None } else { Some(t.ext.clone()) });
-                        }
-                        ui.add_sized([110.0, ROW_H], egui::Label::new(human_size(t.size)));
-                        ui.add_sized([110.0, ROW_H], egui::Label::new(human_size(t.alloc)));
-                        ui.add_sized([90.0, ROW_H], egui::Label::new(t.count.to_string()));
-                        ui.add_sized(
-                            [60.0, ROW_H],
-                            egui::Label::new(format!("{:.1}%", t.size as f64 * 100.0 / total)),
+            ui.add_space(24.0);
+            if cfg!(windows) && !self.mft_ready {
+                theme::card(ui).show(ui, |ui| {
+                    ui.set_max_width(560.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("⚡ Быстрый режим").strong().color(theme::LIKELY));
+                        ui.label(
+                            RichText::new(
+                                "Без прав администратора диск сканируется обходом папок. С правами администратора \
+                                 spacetree читает таблицу MFT напрямую — для целых дисков это обычно намного быстрее.",
+                            )
+                            .weak(),
                         );
+                        ui.add_space(4.0);
+                        if ui.button("Перезапустить от администратора").clicked() {
+                            match relaunch_elevated(self.path_text.trim()) {
+                                Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                                Err(e) => self.message = e,
+                            }
+                        }
                     });
-                }
-            });
-        if let Some(e) = pick_ext {
-            self.highlight_ext = e;
+                });
+            }
+        });
+        if let Some(p) = chosen {
+            self.path_text = p;
+            let ctx = ui.ctx().clone();
+            self.start_scan(&ctx);
         }
     }
 
-    fn top_view(&mut self, ui: &mut Ui) {
+    fn scanning(&mut self, ui: &mut Ui) {
+        let Some(job) = &self.job else { return };
+        let p = &job.progress;
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.25).max(16.0));
+            ui.label(RichText::new(format!("Сканирование {}", job.path)).size(20.0).strong());
+            ui.add_space(12.0);
+            let building = p.phase.load(Relaxed) == spacetree_core::progress::PHASE_BUILDING;
+            let bar = match p.fraction() {
+                Some(f) if !building => egui::ProgressBar::new(f).show_percentage(),
+                _ => egui::ProgressBar::new(1.0).animate(true),
+            };
+            ui.add(bar.desired_width(420.0).text(if building {
+                "Построение дерева…"
+            } else {
+                ""
+            }));
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} файлов · {} · {:.1} с",
+                    p.files.load(Relaxed),
+                    human_size(p.bytes.load(Relaxed)),
+                    job.started.elapsed().as_secs_f32()
+                ))
+                .size(15.0),
+            );
+            let errors = p.errors.load(Relaxed);
+            if errors > 0 {
+                ui.label(RichText::new(format!("нет доступа: {errors}")).weak());
+            }
+            ui.add_space(16.0);
+            if ui.button("⏹ Отмена").clicked() {
+                p.cancel();
+            }
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn tabs(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
-        let tree = &data.out.tree;
-        let mut pick = None;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, ROW_H, data.top.len(), |ui, range| {
-                for i in range {
-                    let id = data.top[i];
-                    ui.horizontal(|ui| {
-                        ui.add_sized([90.0, ROW_H], egui::Label::new(human_size(tree.node(id).size)));
-                        if ui.selectable_label(self.selected == Some(id), tree.path(id)).clicked() {
-                            pick = Some(id);
-                        }
-                    });
+        ui.horizontal(|ui| {
+            let cleanup = format!("Можно удалить · {}", human_size(data.cleanup_total));
+            for (tab, label) in [
+                (Tab::Overview, "Обзор"),
+                (Tab::Types, "Типы файлов"),
+                (Tab::Top, "Крупнейшие файлы"),
+                (Tab::Cleanup, cleanup.as_str()),
+            ] {
+                if ui.add(egui::Button::selectable(self.tab == tab, label)).clicked() {
+                    self.tab = tab;
                 }
-            });
-        if let Some(id) = pick {
-            self.tab = Tab::Tree;
-            self.select(id);
-        }
+            }
+        });
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.poll_job();
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if self.auto_scan {
+            self.auto_scan = false;
+            self.start_scan(&ctx);
+        }
+        if ctx.input(|i| i.key_pressed(Key::F5)) && self.data.is_some() {
+            self.start_scan(&ctx);
+        }
+        self.update_search(&ctx);
+
+        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        if self.job.is_none() && self.data.is_some() {
+            egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        }
+        if self.job.is_some() {
+            egui::CentralPanel::default().show(ui, |ui| self.scanning(ui));
+            return;
+        }
         if self.data.is_none() {
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(if self.job.is_some() {
-                        "Идёт сканирование…"
-                    } else {
-                        "Выберите диск или папку и нажмите «Сканировать»"
-                    });
-                });
+                if !self.message.is_empty() {
+                    ui.colored_label(ui.visuals().error_fg_color, &self.message);
+                }
+                self.welcome(ui)
             });
             return;
         }
         egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Tree, "Дерево и treemap");
-                ui.selectable_value(&mut self.tab, Tab::Types, "Типы файлов");
-                ui.selectable_value(&mut self.tab, Tab::Top, "Крупнейшие файлы");
-            });
+            ui.add_space(2.0);
+            self.tabs(ui);
+            ui.add_space(2.0);
         });
         match self.tab {
-            Tab::Tree => {
+            Tab::Overview => {
                 egui::Panel::left("tree")
                     .resizable(true)
-                    .default_size(640.0)
-                    .show(ui, |ui| self.tree_view(ui));
+                    .default_size(660.0)
+                    .min_size(320.0)
+                    .show(ui, |ui| {
+                        if self.search_active() {
+                            self.search_view(ui)
+                        } else {
+                            self.tree_view(ui)
+                        }
+                    });
                 egui::CentralPanel::default().show(ui, |ui| self.treemap_view(ui));
             }
             Tab::Types => {
@@ -731,16 +764,84 @@ impl eframe::App for App {
             Tab::Top => {
                 egui::CentralPanel::default().show(ui, |ui| self.top_view(ui));
             }
+            Tab::Cleanup => {
+                egui::CentralPanel::default().show(ui, |ui| self.cleanup_view(ui));
+            }
         }
+    }
+}
+
+fn reveal(path: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{path}\""))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new(path));
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+fn open_path(path: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Starts this executable again through the UAC prompt, asking it to scan `path`.
+fn relaunch_elevated(path: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (verb, file) = (w("runas"), w(&exe.to_string_lossy()));
+        // A trailing backslash before the closing quote would escape it (`"C:\"`): double it.
+        let arg = if path.ends_with('\\') {
+            format!("{path}\\")
+        } else {
+            path.to_owned()
+        };
+        let params = w(&format!("\"{arg}\""));
+        // SAFETY: all strings are NUL-terminated and outlive the call; no window handle or directory.
+        let h = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                params.as_ptr(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if h as isize > 32 {
+            Ok(())
+        } else {
+            Err("не удалось перезапуститься от администратора (запрос UAC отклонён?)".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("доступно только в Windows".into())
     }
 }
 
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_title("spacetree"),
+            .with_inner_size([1360.0, 860.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_title("spacetree — анализ места на диске"),
         ..Default::default()
     };
-    eframe::run_native("spacetree", opts, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native("spacetree", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }

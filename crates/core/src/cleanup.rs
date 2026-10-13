@@ -95,15 +95,17 @@ impl Category {
             Category::Temp => {
                 "Папки TEMP пользователя и Windows. Файлы, занятые запущенными программами, просто не удалятся."
             }
-            Category::BrowserCache => "Кэш страниц и шейдеров. Браузер создаст его заново; закройте браузер перед очисткой.",
+            Category::BrowserCache => {
+                "Кэш страниц и шейдеров. Браузер создаст его заново; закройте браузер перед очисткой."
+            }
             Category::AppCache => "Кэш программ (Electron, видеодрайверы и т. п.). Создаётся заново при запуске.",
             Category::Thumbnails => "Миниатюры картинок и значков. Проводник пересоздаст их при просмотре папок.",
             Category::CrashDumps => "Нужны только для диагностики сбоев.",
             Category::WindowsUpdate => {
-                "Уже установленные обновления. Безопаснее чистить через «Очистку диска» или «Параметры → Память»."
+                "Уже установленные обновления. Безопаснее чистить через «Очистку диска» или «Параметры › Память»."
             }
             Category::OldWindows => {
-                "Нужна только для отката на прошлую версию. Удаляйте через «Очистку диска» → «Предыдущие установки Windows»."
+                "Нужна только для отката на прошлую версию. Удаляйте через «Очистку диска» › «Предыдущие установки Windows»."
             }
             Category::TempFiles => "Файлы *.tmp и ~$-файлы Office (если документ сейчас не открыт).",
             Category::Logs => "Журналы программ. Обычно не нужны, но иногда помогают разобраться в проблеме.",
@@ -324,7 +326,11 @@ struct Ctx {
 }
 
 /// Per-user locations of installed software (suffixes of the lower-cased path).
-const INSTALLED_SUFFIXES: &[&str] = &["/appdata/local/programs", "/appdata/roaming/npm", "/appdata/local/microsoft"];
+const INSTALLED_SUFFIXES: &[&str] = &[
+    "/appdata/local/programs",
+    "/appdata/roaming/npm",
+    "/appdata/local/microsoft",
+];
 
 struct Finder<'a> {
     tree: &'a Tree,
@@ -334,7 +340,9 @@ struct Finder<'a> {
 
 impl Finder<'_> {
     fn has_marker(&self, dir: NodeId, marker: &str) -> bool {
-        let Some(parent) = self.tree.parent(dir) else { return false };
+        let Some(parent) = self.tree.parent(dir) else {
+            return false;
+        };
         self.tree
             .children(parent)
             .iter()
@@ -350,7 +358,11 @@ impl Finder<'_> {
         if depth <= 3 || path.contains("/telegram desktop/tdata/") {
             return true;
         }
-        let parent = self.tree.parent(id).map(|p| self.tree.name(p).to_lowercase()).unwrap_or_default();
+        let parent = self
+            .tree
+            .parent(id)
+            .map(|p| self.tree.name(p).to_lowercase())
+            .unwrap_or_default();
         let browser_profile = parent == "default" || parent.starts_with("profile ");
         (browser_profile
             && (path.contains("/user data/") || path.contains("/ebwebview/") || path.contains("/htmlcache/")))
@@ -537,12 +549,7 @@ pub fn find(tree: &Tree, now: u32) -> Vec<Group> {
         g.items.sort_unstable_by_key(|&i| std::cmp::Reverse(tree.node(i).size));
         g.items.retain(|&i| tree.node(i).size > 0);
     }
-    groups.sort_by(|a, b| {
-        a.category
-            .safety()
-            .cmp(&b.category.safety())
-            .then(b.size.cmp(&a.size))
-    });
+    groups.sort_by(|a, b| a.category.safety().cmp(&b.category.safety()).then(b.size.cmp(&a.size)));
     groups
 }
 
@@ -611,7 +618,13 @@ mod tests {
     fn sizes(t: &Tree) -> Vec<(Category, u64, Vec<String>)> {
         find(t, NOW)
             .into_iter()
-            .map(|g| (g.category, g.size, g.items.iter().map(|&i| t.name(i).to_owned()).collect()))
+            .map(|g| {
+                (
+                    g.category,
+                    g.size,
+                    g.items.iter().map(|&i| t.name(i).to_owned()).collect(),
+                )
+            })
             .collect()
     }
 
@@ -622,14 +635,21 @@ mod tests {
         let get = |c: Category| got.iter().find(|g| g.0 == c).map(|g| (g.1, g.2.clone()));
         assert_eq!(get(Category::Temp), Some((150 * M, vec!["Temp".into(), "Temp".into()])));
         assert_eq!(get(Category::BrowserCache), Some((500 * M, vec!["Cache".into()])));
-        assert_eq!(get(Category::DevArtifacts), Some((300 * M, vec!["node_modules".into()])));
+        assert_eq!(
+            get(Category::DevArtifacts),
+            Some((300 * M, vec!["node_modules".into()]))
+        );
         assert_eq!(get(Category::Backups), Some((40 * M, vec!["report.docx.bak".into()])));
         assert_eq!(get(Category::Logs), Some((20 * M, vec!["app.log.3".into()])));
         assert_eq!(get(Category::OldDownloads), Some((1000 * M, vec!["setup.exe".into()])));
         assert_eq!(get(Category::BigOld), Some((2 << 30, vec!["video.mkv".into()])));
         assert_eq!(get(Category::RecycleBin).map(|g| g.0), Some(60 * M));
         assert_eq!(get(Category::Hibernation).map(|g| g.0), Some(8000 * M));
-        assert_eq!(get(Category::TempFiles), None, "x.tmp is inside Temp and must not be counted again");
+        assert_eq!(
+            get(Category::TempFiles),
+            None,
+            "x.tmp is inside Temp and must not be counted again"
+        );
         // safest groups come first
         let order: Vec<Safety> = got.iter().map(|g| g.0.safety()).collect();
         assert!(order.windows(2).all(|w| w[0] <= w[1]));

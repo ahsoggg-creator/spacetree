@@ -3053,8 +3053,10 @@ name = "spacetree-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "rayon",
  "rfd",
  "spacetree-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
