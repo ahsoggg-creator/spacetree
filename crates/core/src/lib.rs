@@ -1,5 +1,6 @@
 //! spacetree core: arena tree model, scanners (parallel walk, NTFS MFT), aggregation, CSV export.
 
+pub mod cleanup;
 pub mod error;
 pub mod export;
 pub mod ntfs;
@@ -18,3 +19,16 @@ pub use error::ScanError;
 pub use progress::Progress;
 pub use scan::{Backend, ScanOutput, Selection, Used, drive_of_root, scan, select_backend};
 pub use tree::{Kind, NodeId, ROOT, Tree};
+
+/// `(total, free)` bytes of the volume that contains `path`; `None` when unknown (or not on Windows).
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        winapi::disk_space(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}

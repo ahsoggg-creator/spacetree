@@ -27,6 +27,9 @@ enum Cmd {
         /// Сохранить все узлы в CSV
         #[arg(long)]
         csv: Option<PathBuf>,
+        /// Показать, что, вероятно, можно удалить
+        #[arg(long)]
+        cleanup: bool,
     },
 }
 
@@ -63,6 +66,7 @@ fn main() -> ExitCode {
         backend,
         top,
         csv,
+        cleanup,
     } = Cli::parse().cmd;
     let path = normalize(path);
     let progress = Progress::default();
@@ -98,6 +102,33 @@ fn main() -> ExitCode {
         println!("\nТоп-{top} файлов:");
         for id in stats::top_files(tree, top) {
             println!("{:>12}  {}", human(tree.node(id).size), tree.path(id));
+        }
+    }
+
+    if cleanup {
+        let t = std::time::Instant::now();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        let groups = spacetree_core::cleanup::find(tree, now);
+        let total: u64 = groups.iter().map(|g| g.size).sum();
+        println!(
+            "
+Можно освободить (оценка): {} · анализ {:.3} с",
+            human(total),
+            t.elapsed().as_secs_f64()
+        );
+        for g in &groups {
+            println!(
+                "{:>12}  [{}] {} — объектов: {}",
+                human(g.size),
+                g.category.safety().label(),
+                g.category.title(),
+                g.items.len()
+            );
+            for &id in g.items.iter().take(3) {
+                println!("{:>12}      {}", human(tree.node(id).size), tree.path(id));
+            }
         }
     }
 

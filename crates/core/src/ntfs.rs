@@ -4,6 +4,7 @@
 //! - FILE record header / flags: <https://flatcap.github.io/linux-ntfs/ntfs/concepts/file_record.html>
 //! - Fixup (update sequence): <https://flatcap.github.io/linux-ntfs/ntfs/concepts/fixup.html>
 //! - Attribute header (resident / non-resident): <https://flatcap.github.io/linux-ntfs/ntfs/concepts/attribute_header.html>
+//! - $STANDARD_INFORMATION: <https://flatcap.github.io/linux-ntfs/ntfs/attributes/standard_information.html>
 //! - $FILE_NAME: <https://flatcap.github.io/linux-ntfs/ntfs/attributes/file_name.html>
 //! - Namespaces: <https://flatcap.github.io/linux-ntfs/ntfs/concepts/filename_namespace.html>
 //! - Data runs: <https://flatcap.github.io/linux-ntfs/ntfs/concepts/data_runs.html>
@@ -12,6 +13,7 @@
 use crate::error::ScanError;
 use crate::tree::{Kind, NO_PARENT, Node, ROOT, Tree};
 
+pub const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 pub const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 pub const ATTR_FILE_NAME: u32 = 0x30;
 pub const ATTR_DATA: u32 = 0x80;
@@ -78,6 +80,8 @@ pub struct BaseRec {
     pub extra_links: u8,
     pub size: u64,
     pub alloc: u64,
+    /// Last modification from $STANDARD_INFORMATION, Unix seconds.
+    pub mtime: u32,
 }
 
 /// Attributes found in an extension record that belong to `base`.
@@ -108,17 +112,20 @@ struct Found {
     size: u64,
     alloc: u64,
     has_data: bool,
+    mtime: u32,
 }
 
 /// Parses one FILE record (fixups are applied in place). `rec_no` is the record's index in $MFT.
 pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
+    // Free records are the majority on many volumes; the flags word lies before the first sector tail,
+    // so it can be checked before (and instead of) applying the fixups.
+    if buf.len() < 0x30 || &buf[0..4] != b"FILE" || u16_at(buf, 0x16) & FLAG_IN_USE == 0 {
+        return;
+    }
     if !apply_fixups(buf) {
         return;
     }
     let flags = u16_at(buf, 0x16);
-    if flags & FLAG_IN_USE == 0 {
-        return;
-    }
     let base_ref = u64_at(buf, 0x20) & FRN_MASK;
     let used = (u32_at(buf, 0x18) as usize).min(buf.len());
     let mut off = u16_at(buf, 0x14) as usize;
@@ -132,6 +139,7 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
         size: 0,
         alloc: 0,
         has_data: false,
+        mtime: 0,
     };
 
     while off + 8 <= used {
@@ -145,6 +153,7 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
         }
         let attr = &buf[off..off + len];
         match ty {
+            ATTR_STANDARD_INFORMATION if attr[8] == 0 => parse_standard_info(attr, &mut f),
             ATTR_FILE_NAME if attr[8] == 0 => parse_file_name(attr, out, &mut f),
             ATTR_DATA if attr[9] == 0 => parse_data(attr, &mut f),
             _ => {}
@@ -172,6 +181,7 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
             extra_links: f.extra_links,
             size: f.size,
             alloc: f.alloc,
+            mtime: f.mtime,
         });
     } else if (f.has_name || f.has_data) && base_ref <= u32::MAX as u64 {
         out.exts.push(ExtRec {
@@ -184,6 +194,19 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
             alloc: f.alloc,
         });
     }
+}
+
+/// `attr` is a resident $STANDARD_INFORMATION attribute; takes the "file altered" time (content offset 0x08).
+fn parse_standard_info(attr: &[u8], f: &mut Found) {
+    if attr.len() < 0x18 {
+        return;
+    }
+    let coff = u16_at(attr, 0x14) as usize;
+    if u32_at(attr, 0x10) < 0x10 || coff + 0x10 > attr.len() {
+        return;
+    }
+    let ft = u64_at(attr, coff + 0x08) as i64;
+    f.mtime = (ft / 10_000_000 - 11_644_473_600).clamp(0, u32::MAX as i64) as u32;
 }
 
 /// `attr` is a resident $FILE_NAME attribute.
@@ -414,7 +437,9 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
         };
         let (size, alloc) = if is_dir { (0, 0) } else { (b.size, b.alloc) };
         let kind = if is_dir { Kind::Dir } else { Kind::File };
-        nodes.push(Node::new(parent, b.name_off, b.name_len, kind, size, alloc));
+        let mut node = Node::new(parent, b.name_off, b.name_len, kind, size, alloc);
+        node.mtime = b.mtime;
+        nodes.push(node);
     }
     // The orphan node is always created so that its id (== nodes.len()) is stable; it is dropped when unused.
     if has_orphans {
@@ -594,8 +619,10 @@ mod tests {
         let root_ref = 5u64;
         let mut recs: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; 1024]).collect();
         recs[5] = record(0x03, 0, &[file_name_attr(5, ".", 1)]);
-        // 16: dir "docs"
-        recs.push(record(0x03, 0, &[file_name_attr(root_ref, "docs", 1)]));
+        // 16: dir "docs", modified 2021-01-01T00:00:00Z
+        let mut si = vec![0u8; 0x30];
+        si[8..16].copy_from_slice(&((1_609_459_200u64 + 11_644_473_600) * 10_000_000).to_le_bytes());
+        recs.push(record(0x03, 0, &[resident(0x10, &si), file_name_attr(root_ref, "docs", 1)]));
         // 17: file with DOS + Win32 names, resident data 10 bytes
         recs.push(record(
             0x01,
@@ -649,6 +676,9 @@ mod tests {
         assert_eq!(size, 10 + 5000 + 777 + 1_000_000 + 3);
         assert_eq!(alloc, 8192 + 4096 + 65536);
         assert_eq!(built.extra_links, 1);
+        let docs = (0..t.len() as u32).find(|&i| t.name(i) == "docs").unwrap();
+        assert_eq!(t.node(docs).mtime, 1_609_459_200);
+        assert_eq!(t.node(0).mtime, 1_609_459_200, "directories carry the latest mtime of their subtree");
         let paths: Vec<String> = (0..t.len() as u32).map(|i| t.path(i)).collect();
         let sep = std::path::MAIN_SEPARATOR;
         assert!(paths.contains(&format!("X:\\docs{sep}long name ü.txt")));

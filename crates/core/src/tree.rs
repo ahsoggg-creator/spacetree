@@ -26,6 +26,8 @@ pub struct Node {
     pub alloc: u64,
     /// Number of regular files in the subtree (1 for a file).
     pub files: u32,
+    /// Last modification, Unix seconds (0 = unknown). For directories: the latest one in the subtree.
+    pub mtime: u32,
     pub name_len: u16,
     pub kind: Kind,
 }
@@ -38,6 +40,7 @@ impl Node {
             size,
             alloc,
             files: 0,
+            mtime: 0,
             name_len,
             kind,
         }
@@ -99,6 +102,9 @@ impl Tree {
                 p.size += nd.size;
                 p.alloc += nd.alloc;
                 p.files += nd.files;
+                if nd.kind != Kind::Link {
+                    p.mtime = p.mtime.max(nd.mtime);
+                }
             }
         }
 

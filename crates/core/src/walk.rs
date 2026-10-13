@@ -1,10 +1,11 @@
-//! Parallel directory walker (rayon). Never follows symlinks, junctions or other directory reparse points.
+//! Parallel directory walker (rayon). Never follows symlinks, junctions or mount points.
 //!
-//! Size on disk: Unix — `st_blocks * 512`; Windows — logical size rounded up to the volume cluster size
-//! (no per-file syscalls; compressed/sparse files and MFT-resident files are therefore approximated).
+//! Windows: directories are listed with `GetFileInformationByHandleEx(FileFullDirectoryInfo)`, which returns
+//! names, sizes, real allocation sizes and timestamps of up to 64 KiB of entries per syscall; paths are kept as
+//! UTF-16 with a `\\?\` prefix, so there is no MAX_PATH limit and no per-file conversion.
+//! Unix: `std::fs::read_dir` + `lstat`; size on disk is `st_blocks * 512`, hard links are counted once.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -25,26 +26,53 @@ struct Ctx<'a> {
     next_id: AtomicU32,
     sinks: Vec<Mutex<Sink>>,
     errors: Mutex<Vec<String>>,
-    cluster: u64,
     #[cfg(unix)]
     seen_links: Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 impl Ctx<'_> {
-    fn error(&self, path: &Path, e: &std::io::Error) {
+    fn error(&self, path: &str, e: &std::io::Error) {
         self.progress.errors.fetch_add(1, Relaxed);
         let mut v = self.errors.lock().unwrap();
         if v.len() < MAX_ERROR_SAMPLES {
-            v.push(format!("{}: {}", path.display(), e));
+            v.push(format!("{path}: {e}"));
         }
     }
 }
 
+/// Entries of one directory; names are packed into `names`.
+#[derive(Default)]
+struct Listing {
+    names: String,
+    entries: Vec<Entry>,
+}
+
 struct Entry {
-    name: String,
+    name_off: u32,
+    name_len: u16,
     kind: Kind,
     size: u64,
     alloc: u64,
+    mtime: u32,
+}
+
+impl Listing {
+    fn push(&mut self, name: &str, kind: Kind, size: u64, alloc: u64, mtime: u32) {
+        let name_off = self.names.len() as u32;
+        self.names.push_str(name);
+        self.entries.push(Entry {
+            name_off,
+            name_len: name.len() as u16,
+            kind,
+            size,
+            alloc,
+            mtime,
+        });
+    }
+
+    fn name(&self, e: &Entry) -> &str {
+        &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize]
+    }
 }
 
 pub struct WalkOutput {
@@ -55,7 +83,7 @@ pub struct WalkOutput {
 
 pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
     let root = std::path::absolute(root)?;
-    let meta = fs::metadata(&root).map_err(|e| ScanError::Io(format!("{}: {e}", root.display())))?;
+    let meta = std::fs::metadata(&root).map_err(|e| ScanError::Io(format!("{}: {e}", root.display())))?;
     if !meta.is_dir() {
         return Err(ScanError::Io(format!("{}: не папка", root.display())));
     }
@@ -71,13 +99,13 @@ pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
         next_id: AtomicU32::new(1),
         sinks: (0..=threads).map(|_| Mutex::new(Sink::default())).collect(),
         errors: Mutex::new(Vec::new()),
-        cluster: cluster_size(&root),
         #[cfg(unix)]
         seen_links: Mutex::new(Default::default()),
     };
 
+    let start = plat::root_path(&root);
     pool.install(|| {
-        rayon::scope(|s| scan_dir(&ctx, s, root.clone(), 0));
+        rayon::scope(|s| scan_dir(&ctx, s, start, 0));
     });
     if progress.is_cancelled() {
         return Err(ScanError::Cancelled);
@@ -108,96 +136,29 @@ pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
     })
 }
 
-fn cluster_size(root: &Path) -> u64 {
-    #[cfg(windows)]
-    {
-        crate::winapi::cluster_size(root).unwrap_or(4096)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = root;
-        1
-    }
-}
-
-fn scan_dir<'s>(ctx: &'s Ctx<'s>, scope: &rayon::Scope<'s>, path: PathBuf, id: u32) {
+fn scan_dir<'s>(ctx: &'s Ctx<'s>, scope: &rayon::Scope<'s>, path: plat::DirPath, id: u32) {
     if ctx.progress.is_cancelled() {
         return;
     }
-    let rd = match fs::read_dir(&path) {
-        Ok(rd) => rd,
-        Err(e) => {
-            ctx.error(&path, &e);
-            return;
-        }
-    };
-
-    let mut entries: Vec<Entry> = Vec::new();
-    for ent in rd {
-        let ent = match ent {
-            Ok(e) => e,
-            Err(e) => {
-                ctx.error(&path, &e);
-                continue;
-            }
-        };
-        let ft = match ent.file_type() {
-            Ok(ft) => ft,
-            Err(e) => {
-                ctx.error(&ent.path(), &e);
-                continue;
-            }
-        };
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if ft.is_symlink() {
-            entries.push(Entry {
-                name,
-                kind: Kind::Link,
-                size: 0,
-                alloc: 0,
-            });
-            continue;
-        }
-        let meta = match ent.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                ctx.error(&ent.path(), &e);
-                continue;
-            }
-        };
-        if ft.is_dir() {
-            let kind = if is_reparse_point(&meta) { Kind::Link } else { Kind::Dir };
-            entries.push(Entry {
-                name,
-                kind,
-                size: 0,
-                alloc: 0,
-            });
-        } else {
-            let Some((size, alloc)) = file_sizes(ctx, &meta) else {
-                continue;
-            };
-            entries.push(Entry {
-                name,
-                kind: Kind::File,
-                size,
-                alloc,
-            });
-        }
+    let mut list = Listing::default();
+    if let Err(e) = plat::list(ctx, &path, &mut list) {
+        ctx.error(&plat::display(&path), &e);
+        return;
     }
-    if entries.is_empty() {
+    if list.entries.is_empty() {
         return;
     }
 
-    let first = ctx.next_id.fetch_add(entries.len() as u32, Relaxed);
+    let first = ctx.next_id.fetch_add(list.entries.len() as u32, Relaxed);
     let (mut files, mut bytes) = (0u64, 0u64);
     {
         let idx = rayon::current_thread_index().map_or(0, |i| i + 1);
         let mut sink = ctx.sinks[idx.min(ctx.sinks.len() - 1)].lock().unwrap();
-        for (i, e) in entries.iter().enumerate() {
-            let off = sink.names.len() as u32;
-            sink.names.push_str(&e.name);
-            let node = Node::new(id, off, e.name.len() as u16, e.kind, e.size, e.alloc);
+        let base = sink.names.len() as u32;
+        sink.names.push_str(&list.names);
+        for (i, e) in list.entries.iter().enumerate() {
+            let mut node = Node::new(id, base + e.name_off, e.name_len, e.kind, e.size, e.alloc);
+            node.mtime = e.mtime;
             sink.nodes.push((first + i as u32, node));
             if e.kind == Kind::File {
                 files += 1;
@@ -208,45 +169,168 @@ fn scan_dir<'s>(ctx: &'s Ctx<'s>, scope: &rayon::Scope<'s>, path: PathBuf, id: u
     ctx.progress.files.fetch_add(files, Relaxed);
     ctx.progress.bytes.fetch_add(bytes, Relaxed);
 
-    for (i, e) in entries.into_iter().enumerate() {
+    for (i, e) in list.entries.iter().enumerate() {
         if e.kind == Kind::Dir {
-            let child = path.join(&e.name);
+            let child = plat::join(&path, list.name(e));
             let child_id = first + i as u32;
             scope.spawn(move |s| scan_dir(ctx, s, child, child_id));
         }
     }
 }
 
+/// FILETIME (100 ns since 1601-01-01) -> Unix seconds, clamped to `u32`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn filetime_to_unix(ft: i64) -> u32 {
+    (ft / 10_000_000 - 11_644_473_600).clamp(0, u32::MAX as i64) as u32
+}
+
 #[cfg(windows)]
-fn is_reparse_point(meta: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
+mod plat {
+    use std::path::Path;
+
+    use super::{Ctx, Listing, filetime_to_unix};
+    use crate::tree::Kind;
+    use crate::winapi;
+
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+    /// UTF-16 path with a `\\?\` prefix, no terminator.
+    pub type DirPath = Vec<u16>;
+
+    pub fn root_path(p: &Path) -> DirPath {
+        let s = p.to_string_lossy();
+        let full = if s.starts_with(r"\\?\") {
+            s.into_owned()
+        } else if let Some(unc) = s.strip_prefix(r"\\") {
+            format!(r"\\?\UNC\{unc}")
+        } else {
+            format!(r"\\?\{s}")
+        };
+        full.encode_utf16().collect()
+    }
+
+    pub fn join(parent: &DirPath, name: &str) -> DirPath {
+        let mut p = Vec::with_capacity(parent.len() + name.len() + 2);
+        p.extend_from_slice(parent);
+        if p.last() != Some(&u16::from(b'\\')) {
+            p.push(u16::from(b'\\'));
+        }
+        p.extend(name.encode_utf16());
+        p
+    }
+
+    pub fn display(p: &DirPath) -> String {
+        let s = String::from_utf16_lossy(p);
+        match s.strip_prefix(r"\\?\UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(s),
+        }
+    }
+
+    /// Cloud-file placeholders (OneDrive etc.) are reparse points too, but they are real folders.
+    fn is_cloud_tag(tag: u32) -> bool {
+        tag & 0xFFFF_0FFF == 0x9000_001A
+    }
+
+    pub fn list(_: &Ctx, path: &DirPath, out: &mut Listing) -> std::io::Result<()> {
+        let mut z = Vec::with_capacity(path.len() + 1);
+        z.extend_from_slice(path);
+        z.push(0);
+        let mut name = String::new();
+        winapi::list_dir(&z, |e| {
+            name.clear();
+            name.extend(char::decode_utf16(e.name.iter().copied()).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)));
+            let reparse = e.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            let mtime = filetime_to_unix(e.mtime);
+            if e.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                let kind = if reparse && !is_cloud_tag(e.reparse_tag) {
+                    Kind::Link
+                } else {
+                    Kind::Dir
+                };
+                out.push(&name, kind, 0, 0, mtime);
+            } else if reparse && e.reparse_tag == IO_REPARSE_TAG_SYMLINK {
+                out.push(&name, Kind::Link, 0, 0, mtime);
+            } else {
+                out.push(&name, Kind::File, e.size, e.alloc, mtime);
+            }
+        })
+    }
 }
 
 #[cfg(not(windows))]
-fn is_reparse_point(_: &fs::Metadata) -> bool {
-    false
-}
+mod plat {
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-/// Returns `None` when the file is a hard link already counted elsewhere (Unix only).
-fn file_sizes(ctx: &Ctx, meta: &fs::Metadata) -> Option<(u64, u64)> {
-    let size = meta.len();
+    use super::{Ctx, Listing};
+    use crate::tree::Kind;
+
+    pub type DirPath = PathBuf;
+
+    pub fn root_path(p: &Path) -> DirPath {
+        p.to_path_buf()
+    }
+
+    pub fn join(parent: &DirPath, name: &str) -> DirPath {
+        parent.join(name)
+    }
+
+    pub fn display(p: &DirPath) -> String {
+        p.display().to_string()
+    }
+
+    pub fn list(ctx: &Ctx, path: &DirPath, out: &mut Listing) -> std::io::Result<()> {
+        for ent in fs::read_dir(path)? {
+            let ent = match ent {
+                Ok(e) => e,
+                Err(e) => {
+                    ctx.error(&display(path), &e);
+                    continue;
+                }
+            };
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let meta = match ent.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    ctx.error(&display(&ent.path()), &e);
+                    continue;
+                }
+            };
+            let mtime = mtime_of(&meta);
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                out.push(&name, Kind::Link, 0, 0, mtime);
+            } else if ft.is_dir() {
+                out.push(&name, Kind::Dir, 0, 0, mtime);
+            } else if let Some((size, alloc)) = file_sizes(ctx, &meta) {
+                out.push(&name, Kind::File, size, alloc, mtime);
+            }
+        }
+        Ok(())
+    }
+
+    fn mtime_of(meta: &fs::Metadata) -> u32 {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
+    }
+
+    /// Returns `None` when the file is a hard link already counted elsewhere.
     #[cfg(unix)]
-    {
+    fn file_sizes(ctx: &Ctx, meta: &fs::Metadata) -> Option<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
         if meta.nlink() > 1 && !ctx.seen_links.lock().unwrap().insert((meta.dev(), meta.ino())) {
             return None;
         }
-        Some((size, meta.blocks() * 512))
+        Some((meta.len(), meta.blocks() * 512))
     }
+
     #[cfg(not(unix))]
-    {
-        let alloc = if size == 0 {
-            0
-        } else {
-            size.div_ceil(ctx.cluster) * ctx.cluster
-        };
-        Some((size, alloc))
+    fn file_sizes(_: &Ctx, meta: &fs::Metadata) -> Option<(u64, u64)> {
+        Some((meta.len(), meta.len()))
     }
 }
