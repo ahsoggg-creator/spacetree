@@ -2,6 +2,9 @@
 
 mod chrome;
 mod delete;
+mod demo;
+mod diag;
+mod growth;
 mod installer;
 mod settings;
 mod theme;
@@ -18,12 +21,14 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Rect, Ui};
 use spacetree_core::cleanup::{self, Group};
+use spacetree_core::dupes::{self, DupProgress, DupSet};
+use spacetree_core::snapshot::{self, Entry, Snapshot};
 use spacetree_core::stats::{TypeStat, top_files, type_stats};
 use spacetree_core::{Backend, NodeId, Progress, ROOT, ScanError, ScanOutput, Tree, Used, export};
 
 use settings::Settings;
 
-const TOP_N: usize = 1000;
+pub const TOP_N: usize = 1000;
 const SEARCH_LIMIT: usize = 5000;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -34,6 +39,15 @@ pub struct Loaded {
     pub types: Vec<TypeStat>,
     pub cleanup: Vec<Group>,
     pub cleanup_total: u64,
+    /// Files worth hashing for content duplicates.
+    pub dup_candidates: Vec<NodeId>,
+    /// Result of the duplicate search (`None` until it was run).
+    pub dup_sets: Option<Vec<DupSet>>,
+    /// For each offered duplicate, the copy that is kept.
+    pub dup_keep: std::collections::HashMap<NodeId, NodeId>,
+    /// This scan as a snapshot, and the earlier snapshots of the same location.
+    pub snapshot: Option<Snapshot>,
+    pub history: Vec<Entry>,
     /// `(total, free)` of the scanned volume.
     pub disk: Option<(u64, u64)>,
     pub analysis: Duration,
@@ -42,18 +56,47 @@ pub struct Loaded {
 
 impl Loaded {
     /// Recomputes the derived lists after the tree changed (deletions).
-    fn reanalyze(&mut self) {
+    pub fn reanalyze(&mut self) {
         let tree = &self.out.tree;
-        let ((top, types), groups) = rayon::join(
+        let ((top, types), (groups, candidates)) = rayon::join(
             || rayon::join(|| top_files(tree, TOP_N), || type_stats(tree, ROOT)),
-            || cleanup::find(tree, now_unix()),
+            || cleanup::find_with_dup_candidates(tree, now_unix()),
         );
-        self.cleanup_total = groups.iter().map(|g| g.size).sum();
         self.cleanup = groups;
+        self.dup_candidates = candidates;
         self.top = top;
         self.types = types;
         self.disk = spacetree_core::disk_space(&self.root_path);
+        self.merge_dups();
     }
+
+    /// (Re)builds the "duplicates" group from `dup_sets` and refreshes the total.
+    pub fn merge_dups(&mut self) {
+        self.cleanup.retain(|g| g.category != cleanup::Category::Duplicates);
+        self.dup_keep.clear();
+        if let Some(sets) = &self.dup_sets
+            && let Some((group, keep)) = cleanup::duplicates_group(&self.out.tree, sets)
+        {
+            self.cleanup.push(group);
+            self.dup_keep = keep;
+        }
+        cleanup::sort_groups(&mut self.cleanup);
+        self.cleanup_total = self.cleanup.iter().map(|g| g.size).sum();
+    }
+
+    /// Space that deleting the redundant copies of the verified duplicates would free.
+    pub fn dup_wasted(&self) -> u64 {
+        self.cleanup
+            .iter()
+            .find(|g| g.category == cleanup::Category::Duplicates)
+            .map_or(0, |g| g.size)
+    }
+}
+
+struct DupJob {
+    progress: Arc<DupProgress>,
+    rx: Receiver<Option<Vec<DupSet>>>,
+    started: Instant,
 }
 
 struct Job {
@@ -68,6 +111,7 @@ pub enum Tab {
     Overview,
     Types,
     Top,
+    Growth,
     Cleanup,
 }
 
@@ -204,6 +248,11 @@ pub struct App {
     /// Items ticked for deletion in the cleanup tab.
     pub marked: HashSet<NodeId>,
     pub delete: delete::DeleteState,
+    pub growth: growth::Growth,
+    dup_job: Option<DupJob>,
+    /// Search result waiting for the tree to be free (a deletion may hold it).
+    dup_pending: Option<Vec<DupSet>>,
+    pub demo: Option<demo::Demo>,
 }
 
 pub fn list_drives() -> Vec<DriveInfo> {
@@ -222,6 +271,22 @@ pub fn list_drives() -> Vec<DriveInfo> {
             path,
         })
         .collect()
+}
+
+/// Saves the snapshot (if enabled) and returns the earlier snapshots of the same location, oldest first.
+fn store_snapshot(snap: &Snapshot, save: bool) -> Vec<Entry> {
+    let Some(base) = settings::dir()
+        .map(|d| d.join("snapshots"))
+        .filter(|_| !settings::is_demo())
+    else {
+        return Vec::new();
+    };
+    if save && let Err(e) = snapshot::save(&base, snap) {
+        diag::warn(format!("cannot save snapshot: {e}"));
+    }
+    let mut history = snapshot::list(&base, &snap.root);
+    history.retain(|e| e.taken < snap.taken);
+    history
 }
 
 pub fn now_unix() -> u32 {
@@ -243,6 +308,9 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
 /// The folder to scan, from the command line (Explorer passes it as `"%1"` / `"%V"`). A drive root comes
 /// as `"C:\"`, which Windows argument parsing turns into `C:"` — repair that.
 fn path_arg() -> Option<String> {
+    if settings::is_demo() {
+        return None; // `--screenshots <dir>`: the argument is an output folder, not something to scan
+    }
     std::env::args()
         .skip(1)
         .find(|a| !a.starts_with("--"))
@@ -267,11 +335,20 @@ impl App {
         theme::install(&cc.egui_ctx);
         let icon = image_from_rgba(include_bytes!("../assets/icon64.rgba"), 64)
             .map(|img| cc.egui_ctx.load_texture("icon", img, egui::TextureOptions::LINEAR));
-        let settings = Settings::load();
+        let settings = if settings::is_demo() {
+            Settings::default()
+        } else {
+            Settings::load()
+        };
         let in_app = matches!(mode, Mode::App);
-        let drives = if in_app { list_drives() } else { Vec::new() };
+        let drives = match (in_app, settings::is_demo()) {
+            (false, _) => Vec::new(),
+            (true, true) => demo::drives(),
+            (true, false) => list_drives(),
+        };
         let arg = if in_app { path_arg() } else { None };
         let mft_ready = in_app
+            && !settings::is_demo()
             && cfg!(windows)
             && drives.first().is_some_and(|d| {
                 spacetree_core::select_backend(std::path::Path::new(&d.path), Backend::Auto)
@@ -327,13 +404,34 @@ impl App {
             cleanup_by_size: false,
             marked: HashSet::new(),
             delete: delete::DeleteState::default(),
+            growth: growth::Growth::default(),
+            dup_job: None,
+            dup_pending: None,
+            demo: None,
         };
+        if in_app && settings::is_demo() {
+            app.demo = Some(demo::Demo::from_args());
+        }
+        if in_app
+            && !settings::is_demo()
+            && let Some(report) = diag::take_unseen_crash()
+        {
+            app.toast(
+                format!(
+                    "Прошлый запуск завершился сбоем. Отчёт сохранён: {} — пришлите его разработчику.",
+                    report.display()
+                ),
+                ToastKind::Error,
+            );
+        }
         if in_app {
             update::cleanup_old();
             if winint::running_installed() {
                 winint::refresh_installed_version();
             }
-            app.maybe_check_updates(&cc.egui_ctx, false);
+            if !settings::is_demo() {
+                app.maybe_check_updates(&cc.egui_ctx, false);
+            }
         }
         app
     }
@@ -393,7 +491,7 @@ impl App {
             update::State::Failed(e) => {
                 self.update_reported = true;
                 // a background check failing (offline etc.) is not worth a popup; settings show it
-                let _ = e;
+                diag::warn(format!("update check failed: {e}"));
             }
             _ => {}
         }
@@ -403,6 +501,10 @@ impl App {
         if self.job.is_some() {
             return;
         }
+        if settings::is_demo() {
+            self.load_demo();
+            return;
+        }
         let mut text = self.path_text.trim().trim_matches('"').to_owned();
         if cfg!(windows) && text.len() == 2 && text.ends_with(':') {
             text.push('\\'); // `C:` alone means "current directory on C:"
@@ -410,18 +512,26 @@ impl App {
         self.path_text = text.clone();
         let path = PathBuf::from(&text);
         let backend = self.backend;
+        let save_snapshots = self.settings.save_snapshots;
         let progress = Arc::new(Progress::default());
         let (tx, rx) = channel();
         let (p, ctx2) = (progress.clone(), ctx.clone());
         std::thread::spawn(move || {
             let res = spacetree_core::scan(&path, backend, &p).map(|out| {
                 let t = Instant::now();
+                let snapshot = Snapshot::from_tree(&out.tree, now_unix() as u64);
+                let history = store_snapshot(&snapshot, save_snapshots);
                 let mut l = Loaded {
                     out,
                     top: Vec::new(),
                     types: Vec::new(),
                     cleanup: Vec::new(),
                     cleanup_total: 0,
+                    dup_candidates: Vec::new(),
+                    dup_sets: None,
+                    dup_keep: Default::default(),
+                    snapshot: Some(snapshot),
+                    history,
                     disk: None,
                     analysis: Duration::ZERO,
                     root_path: path,
@@ -447,35 +557,148 @@ impl App {
         match job.rx.try_recv() {
             Ok(Ok(loaded)) => {
                 let path = job.path.clone();
-                self.data = Some(Arc::new(loaded));
+                let o = &loaded.out;
+                diag::info(format!(
+                    "scan finished: backend={} files={} dirs={} errors={} scan={:.1}s analysis={:.1}s",
+                    o.selection.used.as_str(),
+                    o.tree.root_stats().2,
+                    o.tree.dir_count(),
+                    o.errors,
+                    o.elapsed.as_secs_f32(),
+                    loaded.analysis.as_secs_f32(),
+                ));
+                for sample in &o.error_samples {
+                    diag::warn(format!("scan: {sample}"));
+                }
                 self.job = None;
-                self.generation += 1;
-                self.selected = None;
-                self.tm_root = ROOT;
-                self.tm = None;
-                self.tm_anim = None;
-                self.expanded = HashSet::from([ROOT]);
-                self.rows_dirty = true;
-                self.search_done.clear();
-                self.search_hits.clear();
-                self.cleanup_open.clear();
-                self.marked.clear();
-                self.highlight_ext = None;
-                self.top_order_key = None;
-                self.drives = list_drives();
-                self.settings.push_recent(&path);
-                self.settings.save();
+                self.install(loaded, &path);
             }
             Ok(Err(e)) => {
+                diag::error(format!("scan of {} failed: {e}", job.path));
                 self.message = e.to_string();
                 self.job = None;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                diag::error("scan thread terminated abnormally");
                 self.message = "поток сканирования завершился аварийно".into();
                 self.job = None;
             }
         }
+    }
+
+    /// Makes a finished scan the current data and resets everything that referred to the previous one.
+    pub fn install(&mut self, loaded: Loaded, path: &str) {
+        self.growth = match &loaded.snapshot {
+            Some(cur) => growth::Growth::new(loaded.history.clone(), cur),
+            None => growth::Growth::default(),
+        };
+        self.dup_job = None;
+        self.dup_pending = None;
+        self.data = Some(Arc::new(loaded));
+        self.generation += 1;
+        self.selected = None;
+        self.tm_root = ROOT;
+        self.tm = None;
+        self.tm_anim = None;
+        self.expanded = HashSet::from([ROOT]);
+        self.rows_dirty = true;
+        self.search_done.clear();
+        self.search_hits.clear();
+        self.cleanup_open.clear();
+        self.marked.clear();
+        self.highlight_ext = None;
+        self.top_order_key = None;
+        if !settings::is_demo() {
+            self.drives = list_drives();
+            self.settings.push_recent(path);
+            self.settings.save();
+        }
+    }
+
+    pub fn dup_running(&self) -> bool {
+        self.dup_job.is_some()
+    }
+
+    /// Progress of the duplicate search: `(stage 0..=2, done, total, bytes read, elapsed)`.
+    pub fn dup_progress(&self) -> Option<(u8, u64, u64, u64, Duration)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let j = self.dup_job.as_ref()?;
+        let p = &j.progress;
+        Some((
+            p.stage.load(Relaxed),
+            p.done.load(Relaxed),
+            p.total.load(Relaxed),
+            p.bytes.load(Relaxed),
+            j.started.elapsed(),
+        ))
+    }
+
+    pub fn start_dups(&mut self, ctx: &egui::Context) {
+        let Some(data) = self.data.clone() else { return };
+        if self.dup_job.is_some() {
+            return;
+        }
+        let progress = Arc::new(DupProgress::default());
+        let (tx, rx) = channel();
+        let (p, ctx2) = (progress.clone(), ctx.clone());
+        diag::info(format!(
+            "duplicate search started: {} candidates",
+            data.dup_candidates.len()
+        ));
+        std::thread::spawn(move || {
+            let sets = dupes::find(&data.out.tree, &data.dup_candidates, &p);
+            let _ = tx.send(sets);
+            ctx2.request_repaint();
+        });
+        self.dup_job = Some(DupJob {
+            progress,
+            rx,
+            started: Instant::now(),
+        });
+    }
+
+    pub fn cancel_dups(&self) {
+        if let Some(j) = &self.dup_job {
+            j.progress.cancel();
+        }
+    }
+
+    fn poll_dups(&mut self) {
+        if let Some(job) = &self.dup_job {
+            match job.rx.try_recv() {
+                Ok(Some(sets)) => {
+                    diag::info(format!(
+                        "duplicate search finished: {} sets in {:.1}s",
+                        sets.len(),
+                        job.started.elapsed().as_secs_f32()
+                    ));
+                    self.dup_pending = Some(sets);
+                    self.dup_job = None;
+                }
+                Ok(None) => {
+                    diag::info("duplicate search cancelled");
+                    self.dup_job = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    diag::error("duplicate search thread terminated abnormally");
+                    self.dup_job = None;
+                    self.toast("Поиск дубликатов прервался из-за внутренней ошибки", ToastKind::Error);
+                }
+            }
+        }
+        if self.dup_job.is_some() {
+            return;
+        }
+        let Some(sets) = self.dup_pending.take() else { return };
+        let Some(data) = self.data.as_mut().and_then(Arc::get_mut) else {
+            self.dup_pending = Some(sets); // the tree is still borrowed elsewhere; retry next frame
+            return;
+        };
+        data.dup_sets = Some(sets);
+        data.merge_dups();
+        self.cleanup_open.clear();
     }
 
     /// Called after nodes were removed from the tree.
@@ -652,7 +875,9 @@ impl App {
         let ctx = ui.ctx().clone();
         self.poll_job();
         self.poll_delete();
+        self.poll_dups();
         self.poll_update();
+        self.demo_step(&ctx);
         if let Some((text, kind)) = self.status.lock().unwrap().take() {
             self.toasts.push(Toast {
                 text,
@@ -712,6 +937,9 @@ impl App {
                 }
                 Tab::Top => {
                     egui::CentralPanel::default().show(ui, |ui| self.top_view(ui));
+                }
+                Tab::Growth => {
+                    egui::CentralPanel::default().show(ui, |ui| self.growth_view(ui));
                 }
                 Tab::Cleanup => {
                     if !self.marked.is_empty() {
@@ -805,6 +1033,10 @@ pub fn relaunch_elevated(path: &str) -> Result<(), String> {
 }
 
 fn main() -> eframe::Result {
+    diag::install_panic_hook();
+    if std::env::args().any(|a| a == "--demo" || a == "--screenshots") {
+        settings::set_demo();
+    }
     let mode = if std::env::args().any(|a| a == "--uninstall") {
         Mode::Uninstall(installer::Uninstall::default())
     } else if winint::is_setup_launch() {

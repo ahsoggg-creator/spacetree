@@ -24,8 +24,16 @@ $dist = Join-Path $root "dist"
 if (Test-Path $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
 New-Item -ItemType Directory $dist | Out-Null
 Copy-Item target\release\SpaceTree.exe (Join-Path $dist "SpaceTree.exe")
-Copy-Item target\release\SpaceTree.exe (Join-Path $dist "SpaceTree-Setup.exe")
 Copy-Item target\release\spacetree-cli.exe (Join-Path $dist "spacetree-cli.exe")
+# Authenticode-sign with the self-signed "ahsoggg" certificate (scripts\make_cert.ps1) if it exists on this
+# machine. The signature goes in before the SHA-256 below is computed, and Setup is copied from the signed exe.
+$hasCert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -eq "CN=ahsoggg" }
+if ($hasCert) {
+    & (Join-Path $PSScriptRoot "sign.ps1") (Join-Path $dist "SpaceTree.exe") (Join-Path $dist "spacetree-cli.exe")
+} else {
+    Write-Warning "certificate CN=ahsoggg not found - releasing UNSIGNED (run scripts\make_cert.ps1)"
+}
+Copy-Item (Join-Path $dist "SpaceTree.exe") (Join-Path $dist "SpaceTree-Setup.exe")
 $hash = (Get-FileHash (Join-Path $dist "SpaceTree.exe") -Algorithm SHA256).Hash.ToLower()
 Set-Content -LiteralPath (Join-Path $dist "SpaceTree.exe.sha256") -Value "$hash  SpaceTree.exe" -NoNewline -Encoding ascii
 Get-ChildItem $dist | Format-Table Name, Length

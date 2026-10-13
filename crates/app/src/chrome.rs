@@ -11,7 +11,7 @@ use spacetree_core::Backend;
 use spacetree_core::Used;
 use spacetree_core::stats::human_size;
 
-use crate::{App, Tab, ToastKind, relaunch_elevated, theme, update, winint};
+use crate::{App, Tab, ToastKind, diag, relaunch_elevated, theme, update, winint};
 
 const TOAST_LIFE: f32 = 4.5;
 
@@ -164,10 +164,15 @@ impl App {
         let Some(data) = self.data.clone() else { return };
         ui.add_space(4.0);
         let cleanup = format!("Можно удалить · {}", human_size(data.cleanup_total));
+        let growth = match self.growth.tab_hint() {
+            Some(h) => format!("Что выросло · {h}"),
+            None => "Что выросло".to_owned(),
+        };
         let tabs = [
             (Tab::Overview, "Обзор"),
             (Tab::Types, "Типы файлов"),
             (Tab::Top, "Крупнейшие файлы"),
+            (Tab::Growth, growth.as_str()),
             (Tab::Cleanup, cleanup.as_str()),
         ];
         let mut active_rect = None;
@@ -529,6 +534,37 @@ impl App {
                     self.settings.confirm_delete = confirm;
                     self.settings.save();
                 }
+
+                let mut snaps = self.settings.save_snapshots;
+                if ui
+                    .checkbox(&mut snaps, "Сохранять снимок каждого сканирования («Что выросло»)")
+                    .on_hover_text("Хранится только список крупных папок и их размеры — около мегабайта на диск")
+                    .changed()
+                {
+                    self.settings.save_snapshots = snaps;
+                    self.settings.save();
+                }
+
+                ui.add_space(8.0);
+                ui.heading("Диагностика");
+                ui.label(
+                    RichText::new(
+                        "Журнал ошибок и отчёты о сбоях лежат на этом компьютере и никуда не отправляются. Если что-то сломалось — пришлите их разработчику.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Открыть папку журнала").clicked()
+                        && let Some(d) = diag::logs_dir()
+                    {
+                        let _ = std::fs::create_dir_all(&d);
+                        crate::open_path(&d.to_string_lossy());
+                    }
+                    if ui.button("Скопировать диагностику").clicked() {
+                        ctx.copy_text(diag::report());
+                        self.toast("Диагностика скопирована в буфер обмена", ToastKind::Info);
+                    }
+                });
 
                 if cfg!(windows) {
                     ui.add_space(8.0);

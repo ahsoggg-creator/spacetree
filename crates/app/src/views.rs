@@ -13,12 +13,12 @@ use spacetree_core::{Kind, NodeId, ROOT, Tree};
 use crate::theme::{self, ext_color, shade};
 use crate::{Action, App, ListSort, SortKey, Tab, TmAnim, TmCache, TypeSort, now_unix, sort_list, treemap};
 
-const ROW_H: f32 = 22.0;
+pub(crate) const ROW_H: f32 = 22.0;
 const INDENT: f32 = 16.0;
 const CLEANUP_ITEMS: usize = 300;
 const ZOOM_SECS: f32 = 0.28;
 
-fn font() -> FontId {
+pub(crate) fn font() -> FontId {
     FontId::proportional(13.0)
 }
 
@@ -27,7 +27,7 @@ fn ease_out(t: f32) -> f32 {
 }
 
 /// Right-aligned cell text ending at `right`.
-fn cell(p: &Painter, right: f32, y: f32, text: impl ToString, color: Color32) {
+pub(crate) fn cell(p: &Painter, right: f32, y: f32, text: impl ToString, color: Color32) {
     p.text(
         pos2(right - 8.0, y),
         Align2::RIGHT_CENTER,
@@ -38,7 +38,7 @@ fn cell(p: &Painter, right: f32, y: f32, text: impl ToString, color: Color32) {
 }
 
 /// Shared right-click menu for any node.
-fn node_menu(ui: &mut Ui, tree: &Tree, id: NodeId, act: &mut Option<Action>) {
+pub(crate) fn node_menu(ui: &mut Ui, tree: &Tree, id: NodeId, act: &mut Option<Action>) {
     ui.label(RichText::new(tree.name(id)).strong());
     ui.separator();
     let mut item = |ui: &mut Ui, text: &str, a: Action| {
@@ -59,7 +59,7 @@ fn node_menu(ui: &mut Ui, tree: &Tree, id: NodeId, act: &mut Option<Action>) {
 }
 
 /// A full-width list row with a stable id (so hover animations and context menus survive scrolling).
-fn row(ui: &mut Ui, height: f32, key: impl std::hash::Hash + std::fmt::Debug) -> (Rect, Response, f32) {
+pub(crate) fn row(ui: &mut Ui, height: f32, key: impl std::hash::Hash + std::fmt::Debug) -> (Rect, Response, f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let resp = ui.interact(rect, Id::new(key), Sense::click());
     let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
@@ -67,7 +67,7 @@ fn row(ui: &mut Ui, height: f32, key: impl std::hash::Hash + std::fmt::Debug) ->
 }
 
 /// Row background: selection, animated hover, zebra.
-fn row_bg(ui: &Ui, rect: Rect, selected: bool, hover: f32, i: usize) {
+pub(crate) fn row_bg(ui: &Ui, rect: Rect, selected: bool, hover: f32, i: usize) {
     let v = ui.visuals();
     let base = if i % 2 == 1 {
         v.faint_bg_color
@@ -977,6 +977,8 @@ impl App {
                 .sum()
         };
 
+        let dup_progress = self.dup_progress();
+        let mut dup_cmd = None; // Some(true) = start, Some(false) = cancel
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1018,7 +1020,62 @@ impl App {
                 ui.selectable_value(&mut self.cleanup_by_size, false, "по надёжности");
                 ui.selectable_value(&mut self.cleanup_by_size, true, "по размеру");
             });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Дубликаты по содержимому").strong());
+                if let Some((stage, done, total, bytes, elapsed)) = dup_progress {
+                    let step = match stage {
+                        spacetree_core::dupes::STAGE_SIZES => "сравнение размеров",
+                        spacetree_core::dupes::STAGE_PARTIAL => "хеш начала файлов",
+                        _ => "полный хеш",
+                    };
+                    ui.add(egui::Spinner::new());
+                    ui.label(
+                        RichText::new(format!(
+                            "{step}: {done} из {total} · прочитано {} · {} с",
+                            human_size(bytes),
+                            elapsed.as_secs()
+                        ))
+                        .weak(),
+                    );
+                    if ui.button("Отмена").clicked() {
+                        dup_cmd = Some(false);
+                    }
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                } else if let Some(sets) = &data.dup_sets {
+                    let wasted = data.dup_wasted();
+                    ui.label(
+                        RichText::new(if sets.is_empty() {
+                            "одинаковых файлов не найдено".to_owned()
+                        } else {
+                            format!("наборов: {} · лишние копии занимают {}", sets.len(), human_size(wasted))
+                        })
+                        .weak(),
+                    );
+                    if ui.button("Искать заново").clicked() {
+                        dup_cmd = Some(true);
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "файлов-кандидатов: {} (от 1 МБ, личные данные). Читаются только файлы одинакового размера.",
+                            data.dup_candidates.len()
+                        ))
+                        .weak(),
+                    );
+                    if theme::primary_button(ui, "Найти дубликаты").clicked() {
+                        dup_cmd = Some(true);
+                    }
+                }
+            });
         });
+        match dup_cmd {
+            Some(true) => self.start_dups(ui.ctx()),
+            Some(false) => self.cancel_dups(),
+            None => {}
+        }
         ui.add_space(8.0);
         if data.cleanup.is_empty() {
             ui.label("Ничего подходящего не найдено.");
@@ -1083,6 +1140,12 @@ impl App {
                                 for (i, &id) in g.items.iter().take(CLEANUP_ITEMS).enumerate() {
                                     let nd = tree.node(id);
                                     let (rect, resp, hover) = row(ui, ROW_H, ("cl_item", id));
+                                    let resp = match data.dup_keep.get(&id) {
+                                        Some(&keep) if g.category == Category::Duplicates => resp.on_hover_text(
+                                            format!("Идентичная копия, которая останется:\n{}", tree.path(keep)),
+                                        ),
+                                        _ => resp,
+                                    };
                                     let ticked = self.marked.contains(&id);
                                     row_bg(ui, rect, self.selected == Some(id) || ticked, hover, i);
                                     let p = ui.painter_at(rect);

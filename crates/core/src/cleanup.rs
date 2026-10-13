@@ -87,7 +87,7 @@ impl Category {
             Category::Hibernation => "Файл гибернации",
             Category::Backups => "Резервные копии файлов",
             Category::OldDownloads => "Старые установщики и архивы в «Загрузках»",
-            Category::Duplicates => "Возможные дубликаты",
+            Category::Duplicates => "Дубликаты (одинаковое содержимое)",
             Category::BigOld => "Крупные файлы, не менявшиеся больше года",
         }
     }
@@ -124,7 +124,7 @@ impl Category {
             Category::Backups => "Файлы *.bak, *.old, *~. Убедитесь, что оригиналы на месте.",
             Category::OldDownloads => "Установщики и архивы старше 30 дней. Программы обычно уже установлены.",
             Category::Duplicates => {
-                "Файлы от 1 МБ с одинаковыми именем и размером в разных папках. Самая новая копия сюда не входит.                  Содержимое не сравнивалось — проверьте перед удалением."
+                "Файлы от 1 МБ с полностью совпадающим содержимым (проверено по хешу). Самая новая копия сюда не входит — наведите курсор на строку, чтобы увидеть, какая оставлена."
             }
             Category::BigOld => "Файлы от 1 ГБ без изменений больше года (кроме системных папок). Решайте сами.",
         }
@@ -354,8 +354,8 @@ struct Finder<'a> {
     tree: &'a Tree,
     now: u32,
     found: Vec<(Category, NodeId)>,
-    /// Files that may have copies elsewhere: (size, lower-cased name, node).
-    dup_candidates: Vec<(u64, String, NodeId)>,
+    /// Files worth checking for copies with the same content (see `crate::dupes`).
+    dup_candidates: Vec<NodeId>,
 }
 
 impl Finder<'_> {
@@ -490,6 +490,12 @@ fn is_rotated_log(name: &str) -> bool {
 /// Finds reclaimable files and folders. `now` is the current time in Unix seconds (for age rules).
 /// Groups are ordered by safety, then by size; empty groups are omitted.
 pub fn find(tree: &Tree, now: u32) -> Vec<Group> {
+    find_with_dup_candidates(tree, now).0
+}
+
+/// Like [`find`], plus the files that may have content duplicates: pass them to `dupes::find`
+/// (reading files is slow, so it is a separate step).
+pub fn find_with_dup_candidates(tree: &Tree, now: u32) -> (Vec<Group>, Vec<NodeId>) {
     let mut f = Finder {
         tree,
         now,
@@ -546,29 +552,12 @@ pub fn find(tree: &Tree, now: u32) -> Vec<Group> {
                         && !path.contains("/plugins/")
                         && ext_is(tree.name(c), DUP_EXTS)
                     {
-                        f.dup_candidates
-                            .push((tree.node(c).size, tree.name(c).to_lowercase(), c));
+                        f.dup_candidates.push(c);
                     }
                 }
                 Kind::Link => {}
             }
         }
-    }
-
-    // Same size and name: keep the most recently modified copy, offer the others.
-    let mut cands = std::mem::take(&mut f.dup_candidates);
-    cands.sort_unstable();
-    for same in cands.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
-        if same.len() < 2 {
-            continue;
-        }
-        let keep = same
-            .iter()
-            .max_by_key(|c| (tree.node(c.2).mtime, std::cmp::Reverse(c.2)))
-            .unwrap()
-            .2;
-        f.found
-            .extend(same.iter().filter(|c| c.2 != keep).map(|c| (Category::Duplicates, c.2)));
     }
 
     let mut groups: Vec<Group> = Category::ALL
@@ -594,8 +583,43 @@ pub fn find(tree: &Tree, now: u32) -> Vec<Group> {
         g.items.sort_unstable_by_key(|&i| std::cmp::Reverse(tree.node(i).size));
         g.items.retain(|&i| tree.node(i).size > 0);
     }
+    sort_groups(&mut groups);
+    (groups, f.dup_candidates)
+}
+
+/// Orders groups by safety, then by size.
+pub fn sort_groups(groups: &mut [Group]) {
     groups.sort_by(|a, b| a.category.safety().cmp(&b.category.safety()).then(b.size.cmp(&a.size)));
-    groups
+}
+
+/// The "duplicates" group built from content-verified sets: every copy except the newest one of each set.
+/// Copies deleted from the tree are ignored. Also returns, per offered copy, the copy that is kept.
+pub fn duplicates_group(
+    tree: &Tree,
+    sets: &[crate::dupes::DupSet],
+) -> Option<(Group, std::collections::HashMap<NodeId, NodeId>)> {
+    let mut g = Group {
+        category: Category::Duplicates,
+        items: Vec::new(),
+        size: 0,
+        alloc: 0,
+        files: 0,
+    };
+    let mut keep_of = std::collections::HashMap::new();
+    for set in sets {
+        let mut live = set.items.iter().copied().filter(|&i| !tree.is_removed(i));
+        let Some(keep) = live.next() else { continue };
+        for id in live {
+            let nd = tree.node(id);
+            g.items.push(id);
+            g.size += nd.size;
+            g.alloc += nd.alloc;
+            g.files += 1;
+            keep_of.insert(id, keep);
+        }
+    }
+    g.items.sort_unstable_by_key(|&i| std::cmp::Reverse(tree.node(i).size));
+    (!g.items.is_empty()).then_some((g, keep_of))
 }
 
 #[cfg(test)]
@@ -680,6 +704,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicates_group_offers_all_but_the_newest_and_skips_removed() {
+        let mut t = tree();
+        let (_, cands) = find_with_dup_candidates(&t, NOW);
+        let names: Vec<&str> = cands.iter().map(|&i| t.name(i)).collect();
+        assert!(names.contains(&"Holiday.mp4") && names.contains(&"holiday.mp4"));
+        let id = |n: &str| *cands.iter().find(|&&i| t.name(i) == n).unwrap();
+        let (old, new) = (id("Holiday.mp4"), id("holiday.mp4"));
+        let set = crate::dupes::DupSet {
+            size: 600 * M,
+            items: vec![new, old],
+        };
+        let (g, keep) = duplicates_group(&t, std::slice::from_ref(&set)).unwrap();
+        assert_eq!((g.items.clone(), g.size, keep[&old]), (vec![old], 600 * M, new));
+        t.remove(old);
+        assert!(duplicates_group(&t, &[set]).is_none(), "nothing left to offer");
+    }
+
+    #[test]
     fn finds_expected_categories_without_double_counting() {
         let t = tree();
         let got = sizes(&t);
@@ -696,7 +738,11 @@ mod tests {
         assert_eq!(get(Category::BigOld), Some((2 << 30, vec!["video.mkv".into()])));
         assert_eq!(get(Category::RecycleBin).map(|g| g.0), Some(60 * M));
         assert_eq!(get(Category::Hibernation).map(|g| g.0), Some(8000 * M));
-        assert_eq!(get(Category::Duplicates), Some((600 * M, vec!["Holiday.mp4".into()])));
+        assert_eq!(
+            get(Category::Duplicates),
+            None,
+            "duplicates come from content hashing, not from names"
+        );
         assert_eq!(
             get(Category::TempFiles),
             None,

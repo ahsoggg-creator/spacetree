@@ -30,6 +30,9 @@ enum Cmd {
         /// Показать, что, вероятно, можно удалить
         #[arg(long)]
         cleanup: bool,
+        /// Найти дубликаты по содержимому (размер → хеш начала → полный хеш)
+        #[arg(long)]
+        dupes: bool,
     },
 }
 
@@ -67,6 +70,7 @@ fn main() -> ExitCode {
         top,
         csv,
         cleanup,
+        dupes,
     } = Cli::parse().cmd;
     let path = normalize(path);
     let progress = Progress::default();
@@ -128,6 +132,27 @@ fn main() -> ExitCode {
             );
             for &id in g.items.iter().take(3) {
                 println!("{:>12}      {}", human(tree.node(id).size), tree.path(id));
+            }
+        }
+    }
+
+    if dupes {
+        let t = std::time::Instant::now();
+        let (_, candidates) = spacetree_core::cleanup::find_with_dup_candidates(tree, 0);
+        let progress = spacetree_core::dupes::DupProgress::default();
+        let sets = spacetree_core::dupes::find(tree, &candidates, &progress).unwrap_or_default();
+        let wasted: u64 = sets.iter().map(|s| s.wasted()).sum();
+        println!(
+            "\nДубликаты по содержимому: наборов {}, лишнего места {} · кандидатов {} · {:.3} с",
+            sets.len(),
+            human(wasted),
+            candidates.len(),
+            t.elapsed().as_secs_f64()
+        );
+        for set in sets.iter().take(10) {
+            println!("{:>12}  × {}", human(set.size), set.items.len());
+            for &id in &set.items {
+                println!("{:>12}      {}", "", tree.path(id));
             }
         }
     }

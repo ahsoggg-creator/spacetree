@@ -1,10 +1,22 @@
 //! Persistent user settings: `%APPDATA%\SpaceTree\settings.json` (or `~/.config/spacetree`).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 const MAX_RECENT: usize = 8;
+
+/// Demo mode (`--demo`): fake data for screenshots; nothing is written to disk.
+static DEMO: AtomicBool = AtomicBool::new(false);
+
+pub fn set_demo() {
+    DEMO.store(true, Ordering::Relaxed);
+}
+
+pub fn is_demo() -> bool {
+    DEMO.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +31,8 @@ pub struct Settings {
     pub color_by_age: bool,
     /// Delete to the recycle bin unless the user explicitly asks for permanent deletion.
     pub confirm_delete: bool,
+    /// Save a snapshot of every scan to show what has grown since.
+    pub save_snapshots: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +43,7 @@ impl Default for Settings {
             recent: Vec::new(),
             color_by_age: false,
             confirm_delete: true,
+            save_snapshots: true,
         }
     }
 }
@@ -55,7 +70,7 @@ impl Settings {
 
     /// Best effort: settings are a convenience, failing to save them is not worth an error dialog.
     pub fn save(&self) {
-        let Some(f) = file() else { return };
+        let Some(f) = file().filter(|_| !is_demo()) else { return };
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }

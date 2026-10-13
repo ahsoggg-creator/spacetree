@@ -118,6 +118,10 @@ impl App {
     }
 
     fn start_delete(&mut self, p: Pending) {
+        if crate::settings::is_demo() {
+            self.toast("В демо-режиме ничего не удаляется", ToastKind::Info);
+            return;
+        }
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
         // (node, path, is the recycle-bin folder whose children go away)
@@ -184,6 +188,14 @@ impl App {
         if let Some(r) = &self.delete.running {
             match r.rx.try_recv() {
                 Ok(o) => {
+                    crate::diag::info(format!(
+                        "delete finished: {} removed, {} failed",
+                        o.removed.len(),
+                        o.failed.len()
+                    ));
+                    for (path, why) in &o.failed {
+                        crate::diag::warn(format!("cannot delete {path}: {why}"));
+                    }
                     self.delete.running = None;
                     self.delete.waiting = Some(o);
                 }

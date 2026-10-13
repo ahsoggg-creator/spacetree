@@ -1,11 +1,13 @@
 //! spacetree core: arena tree model, scanners (parallel walk, NTFS MFT), aggregation, CSV export.
 
 pub mod cleanup;
+pub mod dupes;
 pub mod error;
 pub mod export;
 pub mod ntfs;
 pub mod progress;
 pub mod scan;
+pub mod snapshot;
 pub mod stats;
 pub mod tree;
 pub mod walk;
