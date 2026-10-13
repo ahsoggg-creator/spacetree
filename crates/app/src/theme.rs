@@ -125,3 +125,59 @@ pub fn card(ui: &Ui) -> egui::Frame {
         .corner_radius(10)
         .inner_margin(Margin::same(12))
 }
+
+/// Linear blend between two colors (`t` in 0..=1).
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()), m(a.a(), b.a()))
+}
+
+/// Treemap color by modification age: fresh = warm, old = cold.
+pub fn age_color(mtime: u32, now: u32) -> Color32 {
+    if mtime == 0 {
+        return Color32::from_gray(120);
+    }
+    let days = now.saturating_sub(mtime) as f32 / 86_400.0;
+    const STOPS: [(f32, Color32); 6] = [
+        (0.0, Color32::from_rgb(240, 90, 80)),
+        (7.0, Color32::from_rgb(245, 160, 70)),
+        (30.0, Color32::from_rgb(230, 210, 90)),
+        (180.0, Color32::from_rgb(110, 200, 120)),
+        (365.0, Color32::from_rgb(80, 160, 230)),
+        (1095.0, Color32::from_rgb(140, 110, 220)),
+    ];
+    for w in STOPS.windows(2) {
+        if days < w[1].0 {
+            return lerp_color(w[0].1, w[1].1, (days - w[0].0) / (w[1].0 - w[0].0));
+        }
+    }
+    STOPS[STOPS.len() - 1].1
+}
+
+/// Legend entries for [`age_color`].
+pub const AGE_LEGEND: [(&str, u32); 6] = [
+    ("сегодня", 0),
+    ("неделя", 7),
+    ("месяц", 30),
+    ("полгода", 180),
+    ("год", 365),
+    ("3+ года", 1095),
+];
+
+/// Indeterminate progress: an accent segment sliding along a track.
+pub fn marquee(ui: &mut Ui, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 8.0), Sense::hover());
+    ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    let t = (ui.input(|i| i.time) * 0.8).fract() as f32;
+    let seg = width * 0.3;
+    let x = rect.left() - seg + (width + seg) * t;
+    let r = Rect::from_min_max(
+        egui::pos2(x.max(rect.left()), rect.top()),
+        egui::pos2((x + seg).min(rect.right()), rect.bottom()),
+    );
+    if r.width() > 0.0 {
+        ui.painter().rect_filled(r, 4.0, ACCENT);
+    }
+    ui.ctx().request_repaint();
+}

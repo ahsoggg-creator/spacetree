@@ -1,8 +1,13 @@
 [package]
 name = "spacetree"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+
+# Not "spacetree": NTFS is case-insensitive and the GUI is SpaceTree.exe in the same target folder.
+[[bin]]
+name = "spacetree-cli"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-spacetree-core = { version = "0.1.0", path = "../core" }
+spacetree-core = { version = "0.2.0", path = "../core" }

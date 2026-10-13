@@ -40,7 +40,7 @@ pub fn top_files(tree: &Tree, n: usize) -> Vec<NodeId> {
         .enumerate()
         .with_min_len(16384)
         .fold(Heap::new, |mut h, (i, nd)| {
-            if nd.kind == Kind::File {
+            if nd.kind == Kind::File && !nd.removed {
                 offer(&mut h, Reverse((nd.size, i as NodeId)));
             }
             h
@@ -115,7 +115,7 @@ pub fn type_stats(tree: &Tree, root: NodeId) -> Vec<TypeStat> {
             .enumerate()
             .with_min_len(4096)
             .fold(TypeMap::new, |mut m, (i, nd)| {
-                if nd.kind == Kind::File {
+                if nd.kind == Kind::File && !nd.removed {
                     add_type(&mut m, tree.name(i as NodeId), nd.size, nd.alloc);
                 }
                 m

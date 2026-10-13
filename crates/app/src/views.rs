@@ -1,21 +1,29 @@
 //! The four tabs: overview (tree / search results + treemap), file types, largest files, cleanup.
 
+use std::time::Instant;
+
 use eframe::egui::{
-    self, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
+    self, Align2, Color32, FontId, Id, Key, Painter, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
+    Ui, pos2, vec2,
 };
-use spacetree_core::cleanup::Safety;
+use spacetree_core::cleanup::{Category, Safety};
 use spacetree_core::stats::{extension, format_date, human_size};
 use spacetree_core::{Kind, NodeId, ROOT, Tree};
 
 use crate::theme::{self, ext_color, shade};
-use crate::{Action, App, SortKey, Tab, TmCache, treemap};
+use crate::{Action, App, ListSort, SortKey, Tab, TmAnim, TmCache, TypeSort, now_unix, sort_list, treemap};
 
 const ROW_H: f32 = 22.0;
 const INDENT: f32 = 16.0;
 const CLEANUP_ITEMS: usize = 300;
+const ZOOM_SECS: f32 = 0.28;
 
 fn font() -> FontId {
     FontId::proportional(13.0)
+}
+
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
 /// Right-aligned cell text ending at `right`.
@@ -33,37 +41,57 @@ fn cell(p: &Painter, right: f32, y: f32, text: impl ToString, color: Color32) {
 fn node_menu(ui: &mut Ui, tree: &Tree, id: NodeId, act: &mut Option<Action>) {
     ui.label(RichText::new(tree.name(id)).strong());
     ui.separator();
-    if ui.button("Показать в обзоре").clicked() {
-        *act = Some(Action::Show(id));
-        ui.close();
-    }
-    if ui.button("Показать в Проводнике").clicked() {
-        *act = Some(Action::Reveal(id));
-        ui.close();
-    }
-    if ui.button("Открыть").clicked() {
-        *act = Some(Action::Open(id));
-        ui.close();
-    }
-    if ui.button("Копировать путь").clicked() {
-        *act = Some(Action::CopyPath(id));
-        ui.close();
+    let mut item = |ui: &mut Ui, text: &str, a: Action| {
+        if ui.button(text).clicked() {
+            *act = Some(a);
+            ui.close();
+        }
+    };
+    item(ui, "Показать в обзоре", Action::Show(id));
+    item(ui, "Показать в Проводнике", Action::Reveal(id));
+    item(ui, "Открыть", Action::Open(id));
+    item(ui, "Копировать путь", Action::CopyPath(id));
+    if id != ROOT {
+        ui.separator();
+        item(ui, "Удалить в корзину          Del", Action::Delete(id, false));
+        item(ui, "Удалить безвозвратно…  Shift+Del", Action::Delete(id, true));
     }
 }
 
-/// Row background: selection, hover, zebra.
-fn row_bg(ui: &Ui, rect: Rect, selected: bool, hovered: bool, i: usize) {
+/// A full-width list row with a stable id (so hover animations and context menus survive scrolling).
+fn row(ui: &mut Ui, height: f32, key: impl std::hash::Hash + std::fmt::Debug) -> (Rect, Response, f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let resp = ui.interact(rect, Id::new(key), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    (rect, resp, hover)
+}
+
+/// Row background: selection, animated hover, zebra.
+fn row_bg(ui: &Ui, rect: Rect, selected: bool, hover: f32, i: usize) {
     let v = ui.visuals();
-    let fill = if selected {
-        v.selection.bg_fill
-    } else if hovered {
-        v.widgets.hovered.weak_bg_fill
-    } else if i % 2 == 1 {
+    let base = if i % 2 == 1 {
         v.faint_bg_color
     } else {
-        return;
+        Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, 4.0, fill);
+    let fill = if selected {
+        v.selection.bg_fill
+    } else {
+        theme::lerp_color(base, v.widgets.hovered.weak_bg_fill, hover)
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+}
+
+/// Expand/collapse triangle (pointing right when closed, down when open).
+fn disclosure(p: &Painter, c: Pos2, open: f32, color: Color32) {
+    // rotate the "closed" triangle by up to 90°
+    let a = open * std::f32::consts::FRAC_PI_2;
+    let (s, co) = a.sin_cos();
+    let rot = |v: egui::Vec2| c + vec2(v.x * co - v.y * s, v.x * s + v.y * co);
+    let pts = vec![rot(vec2(-2.5, -4.0)), rot(vec2(3.0, 0.0)), rot(vec2(-2.5, 4.0))];
+    p.add(Shape::convex_polygon(pts, color, Stroke::NONE));
 }
 
 /// Small folder glyph centered at `c` (the emoji font has no good one).
@@ -74,16 +102,6 @@ fn folder_icon(p: &Painter, c: Pos2, color: Color32) {
     p.rect_filled(body, 1.5, color);
 }
 
-/// Expand/collapse triangle (pointing right when closed, down when open).
-fn disclosure(p: &Painter, c: Pos2, open: bool, color: Color32) {
-    let pts = if open {
-        vec![c + vec2(-4.0, -2.5), c + vec2(4.0, -2.5), c + vec2(0.0, 3.0)]
-    } else {
-        vec![c + vec2(-2.5, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.5, 4.0)]
-    };
-    p.add(Shape::convex_polygon(pts, color, Stroke::NONE));
-}
-
 /// Small up/down triangle centered at `c`.
 fn sort_arrow(p: &Painter, c: Pos2, desc: bool, color: Color32) {
     let pts = if desc {
@@ -92,6 +110,23 @@ fn sort_arrow(p: &Painter, c: Pos2, desc: bool, color: Color32) {
         vec![c + vec2(-4.0, 2.0), c + vec2(4.0, 2.0), c + vec2(0.0, -3.0)]
     };
     p.add(Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// Checkbox drawn inside a row (the row itself handles the click).
+fn tick(p: &Painter, c: Pos2, on: bool, ui: &Ui) {
+    let r = Rect::from_center_size(c, vec2(14.0, 14.0));
+    if on {
+        p.rect_filled(r, 3.0, theme::ACCENT);
+        let pts = [c + vec2(-3.5, 0.0), c + vec2(-1.0, 3.0), c + vec2(4.0, -3.0)];
+        p.line(pts.to_vec(), Stroke::new(2.0, Color32::WHITE));
+    } else {
+        p.rect_stroke(
+            r,
+            3.0,
+            Stroke::new(1.2, ui.visuals().weak_text_color()),
+            StrokeKind::Inside,
+        );
+    }
 }
 
 /// File-type marker: folder glyph, link glyph or a colored square.
@@ -108,35 +143,37 @@ fn kind_icon(p: &Painter, tree: &Tree, id: NodeId, at: Pos2, text: Color32) {
     }
 }
 
-impl App {
-    fn sort_header(&mut self, p: &Painter, resp: &egui::Response, rect: Rect, key: SortKey, label: &str, right: bool) {
-        let active = self.sort == key;
-        let weak = Color32::from_gray(140);
-        let color = if active { theme::ACCENT } else { weak };
-        let y = rect.center().y;
-        let text = if right {
-            p.text(pos2(rect.right() - 8.0, y), Align2::RIGHT_CENTER, label, font(), color)
-        } else {
-            p.text(pos2(rect.left() + 8.0, y), Align2::LEFT_CENTER, label, font(), color)
-        };
-        if active {
-            let x = if right { text.left() - 9.0 } else { text.right() + 9.0 };
-            sort_arrow(p, pos2(x, y), self.sort_desc, color);
-        }
-        if resp.clicked()
-            && let Some(pos) = resp.interact_pointer_pos()
-            && rect.contains(pos)
-        {
-            if active {
-                self.sort_desc = !self.sort_desc;
-            } else {
-                self.sort = key;
-                self.sort_desc = key != SortKey::Name;
-            }
-            self.rows_dirty = true;
-        }
+/// Clickable column header; returns true when clicked.
+fn header(p: &Painter, resp: &Response, rect: Rect, label: &str, right: bool, sort: Option<bool>) -> bool {
+    let color = if sort.is_some() {
+        theme::ACCENT
+    } else {
+        Color32::from_gray(140)
+    };
+    let y = rect.center().y;
+    let text = if right {
+        p.text(pos2(rect.right() - 8.0, y), Align2::RIGHT_CENTER, label, font(), color)
+    } else {
+        p.text(pos2(rect.left() + 8.0, y), Align2::LEFT_CENTER, label, font(), color)
+    };
+    if let Some(desc) = sort {
+        let x = if right { text.left() - 9.0 } else { text.right() + 9.0 };
+        sort_arrow(p, pos2(x, y), desc, color);
     }
+    resp.clicked() && resp.interact_pointer_pos().is_some_and(|pos| rect.contains(pos))
+}
 
+/// Toggle helper for `(key, descending)` sort state; names sort ascending first.
+fn toggle_sort<K: PartialEq + Copy>(state: &mut (K, bool), key: K, name_key: K) -> bool {
+    if state.0 == key {
+        state.1 = !state.1;
+    } else {
+        *state = (key, key != name_key);
+    }
+    true
+}
+
+impl App {
     pub fn tree_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
@@ -161,49 +198,55 @@ impl App {
         let (r_date, r_files, r_pct, r_alloc, r_size) =
             (col(w_date), col(w_files), col(w_pct), col(w_size), col(w_size));
         let r_name = Rect::from_min_max(hdr.min, pos2(r_size.left(), hdr.bottom()));
-        self.sort_header(&p, &hresp, r_name, SortKey::Name, "Имя", false);
-        self.sort_header(&p, &hresp, r_size, SortKey::Size, "Размер", true);
-        p.text(
-            pos2(r_alloc.right() - 8.0, hdr.center().y),
-            Align2::RIGHT_CENTER,
-            "На диске",
-            font(),
-            weak,
-        );
-        p.text(
-            pos2(r_pct.right() - 8.0, hdr.center().y),
-            Align2::RIGHT_CENTER,
-            "% папки",
-            font(),
-            weak,
-        );
-        self.sort_header(&p, &hresp, r_files, SortKey::Files, "Файлов", true);
-        self.sort_header(&p, &hresp, r_date, SortKey::Modified, "Изменён", true);
+        let mut st = (self.sort, self.sort_desc);
+        let mut changed = None;
+        for (r, k, label, right) in [
+            (r_name, SortKey::Name, "Имя", false),
+            (r_size, SortKey::Size, "Размер", true),
+            (r_files, SortKey::Files, "Файлов", true),
+            (r_date, SortKey::Modified, "Изменён", true),
+        ] {
+            if header(&p, &hresp, r, label, right, (st.0 == k).then_some(st.1)) {
+                changed = Some(k);
+            }
+        }
+        header(&p, &hresp, r_alloc, "На диске", true, None);
+        header(&p, &hresp, r_pct, "% папки", true, None);
+        if let Some(k) = changed {
+            toggle_sort(&mut st, k, SortKey::Name);
+            (self.sort, self.sort_desc) = st;
+            self.rows_dirty = true;
+        }
         ui.painter().hline(
             hdr.x_range(),
             hdr.bottom(),
             ui.visuals().widgets.noninteractive.bg_stroke,
         );
 
+        let mut act: Option<Action> = None;
+        self.tree_keys(ui, tree, &mut act);
+
         let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(r) = self.scroll_to.take() {
             sa = sa.vertical_scroll_offset((r as f32 * (ROW_H + ui.spacing().item_spacing.y) - 80.0).max(0.0));
         }
-        let mut act: Option<Action> = None;
         let selected = self.selected;
         let rows = &self.rows;
         let expanded = &self.expanded;
         sa.show_rows(ui, ROW_H, rows.len(), |ui, range| {
             for i in range {
                 let (id, depth) = rows[i];
-                let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
-                row_bg(ui, rect, selected == Some(id), resp.hovered(), i);
+                let (rect, resp, hover) = row(ui, ROW_H, ("tree", id));
+                row_bg(ui, rect, selected == Some(id), hover, i);
                 let painter = ui.painter_at(rect);
                 let nd = tree.node(id);
                 let is_dir = nd.kind == Kind::Dir;
                 let tx = rect.left() + 4.0 + depth as f32 * INDENT;
                 if is_dir && !tree.children(id).is_empty() {
-                    disclosure(&painter, pos2(tx + 6.0, rect.center().y), expanded.contains(&id), weak);
+                    let open = ui
+                        .ctx()
+                        .animate_bool_with_time(Id::new(("open", id)), expanded.contains(&id), 0.12);
+                    disclosure(&painter, pos2(tx + 6.0, rect.center().y), open, weak);
                 }
                 let name_clip = Rect::from_min_max(rect.min, pos2(rect.right() - cols_w, rect.bottom()));
                 let np = ui.painter_at(name_clip);
@@ -256,9 +299,80 @@ impl App {
             }
         });
         if let Some(a) = act {
-            // a click in the tree keeps the tab; Show only re-targets the treemap
             self.apply(ui.ctx(), a);
         }
+    }
+
+    /// Arrow keys move through the tree: ↑/↓ select, › expand / enter, ← collapse / go to the parent.
+    fn tree_keys(&mut self, ui: &Ui, tree: &Tree, act: &mut Option<Action>) {
+        if ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        let (up, down, left, right, enter) = ui.input(|i| {
+            (
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::ArrowRight),
+                i.key_pressed(Key::Enter),
+            )
+        });
+        if !(up || down || left || right || enter) {
+            return;
+        }
+        let pos = self.selected.and_then(|s| self.rows.iter().position(|&(r, _)| r == s));
+        let Some(pos) = pos else {
+            if let Some(&(first, _)) = self.rows.first() {
+                *act = Some(Action::Show(first));
+            }
+            return;
+        };
+        let id = self.rows[pos].0;
+        if up && pos > 0 {
+            *act = Some(Action::Show(self.rows[pos - 1].0));
+        } else if down && pos + 1 < self.rows.len() {
+            *act = Some(Action::Show(self.rows[pos + 1].0));
+        } else if right && tree.is_dir(id) {
+            if !self.expanded.contains(&id) {
+                *act = Some(Action::Toggle(id));
+            } else if let Some(&c) = tree.children(id).first() {
+                *act = Some(Action::Show(c));
+            }
+        } else if left {
+            if tree.is_dir(id) && self.expanded.contains(&id) {
+                *act = Some(Action::Toggle(id));
+            } else if let Some(p) = tree.parent(id) {
+                *act = Some(Action::Show(p));
+            }
+        } else if enter && tree.is_dir(id) {
+            *act = Some(Action::Toggle(id));
+        }
+    }
+
+    fn sort_chips(ui: &mut Ui, state: &mut (ListSort, bool)) -> bool {
+        let mut changed = false;
+        ui.label(RichText::new("Сортировка:").weak());
+        for (k, label) in [
+            (ListSort::Size, "размер"),
+            (ListSort::Modified, "дата"),
+            (ListSort::Name, "имя"),
+        ] {
+            let on = state.0 == k;
+            let arrow = if !on {
+                ""
+            } else if state.1 {
+                " ↓"
+            } else {
+                " ↑"
+            };
+            if ui
+                .add(egui::Button::selectable(on, format!("{label}{arrow}")))
+                .clicked()
+            {
+                changed = toggle_sort(state, k, ListSort::Name);
+            }
+        }
+        changed
     }
 
     pub fn search_view(&mut self, ui: &mut Ui) {
@@ -269,24 +383,29 @@ impl App {
             if self.search_truncated {
                 ui.label(RichText::new("(показаны крупнейшие)").weak());
             }
-            if ui.small_button("× Сбросить поиск").clicked() {
-                self.search.clear();
+            if ui.small_button("× Сбросить").clicked() {
+                self.clear_search();
+            }
+        });
+        ui.horizontal(|ui| {
+            if Self::sort_chips(ui, &mut self.search_sort) {
+                self.resort_search();
             }
         });
         ui.separator();
-        let width = ui.available_width();
         let weak = ui.visuals().weak_text_color();
         let text_col = ui.visuals().text_color();
         let mut act = None;
         let selected = self.selected;
         let hits = &self.search_hits;
+        let mut retarget = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, ROW_H * 2.0, hits.len(), |ui, range| {
                 for i in range {
                     let id = hits[i];
-                    let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H * 2.0), Sense::click());
-                    row_bg(ui, rect, selected == Some(id), resp.hovered(), i);
+                    let (rect, resp, hover) = row(ui, ROW_H * 2.0, ("hit", id));
+                    row_bg(ui, rect, selected == Some(id), hover, i);
                     let p = ui.painter_at(rect.shrink2(vec2(0.0, 1.0)));
                     let top = rect.top() + ROW_H * 0.55;
                     kind_icon(&p, tree, id, pos2(rect.left() + 8.0, top), text_col);
@@ -297,7 +416,9 @@ impl App {
                         font(),
                         text_col,
                     );
-                    cell(&p, rect.right(), top, human_size(tree.node(id).size), text_col);
+                    let nd = tree.node(id);
+                    cell(&p, rect.right(), top, human_size(nd.size), text_col);
+                    cell(&p, rect.right() - 90.0, top, format_date(nd.mtime), weak);
                     let parent = tree.parent(id).map(|p| tree.path(p)).unwrap_or_default();
                     p.text(
                         pos2(rect.left() + 28.0, rect.top() + ROW_H * 1.45),
@@ -308,23 +429,60 @@ impl App {
                     );
                     if resp.clicked() {
                         act = Some(Action::Select(id));
-                        self.tm_root = if tree.is_dir(id) {
+                        retarget = Some(if tree.is_dir(id) {
                             id
                         } else {
                             tree.parent(id).unwrap_or(ROOT)
-                        };
+                        });
                     }
                     resp.context_menu(|ui| node_menu(ui, tree, id, &mut act));
                 }
             });
+        if let Some(r) = retarget {
+            self.tm_root = r;
+        }
         if let Some(a) = act {
             self.apply(ui.ctx(), a);
         }
     }
 
+    /// Starts the zoom transition from the previous treemap root to the new one.
+    fn start_zoom(&mut self, tree: &Tree, old: &TmCache, size: egui::Vec2) {
+        let full = Rect::from_min_size(Pos2::ZERO, size);
+        let new_root = self.tm_root;
+        let from = if tree.ancestors(new_root).contains(&old.root) {
+            // zoom in: the new root grows out of its tile in the old layout
+            tree.ancestors(new_root)
+                .iter()
+                .rev()
+                .find_map(|a| old.rects.iter().find(|r| r.id == *a).map(|r| r.rect))
+        } else if tree.ancestors(old.root).contains(&new_root) {
+            // zoom out: start magnified so that the old root fills the view, then shrink to its tile
+            let layout = treemap::layout(tree, new_root, full);
+            tree.ancestors(old.root)
+                .iter()
+                .rev()
+                .find_map(|a| layout.iter().find(|r| r.id == *a).map(|r| r.rect))
+                .map(|r| {
+                    let (sx, sy) = (full.width() / r.width().max(1.0), full.height() / r.height().max(1.0));
+                    Rect::from_min_size(
+                        pos2(-r.min.x * sx, -r.min.y * sy),
+                        vec2(full.width() * sx, full.height() * sy),
+                    )
+                })
+        } else {
+            None
+        };
+        self.tm_anim = from.map(|from| TmAnim {
+            from,
+            start: Instant::now(),
+        });
+    }
+
     pub fn treemap_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
+        let by_age = self.settings.color_by_age;
         let mut goto: Option<NodeId> = None;
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -348,22 +506,36 @@ impl App {
                 }
             }
             ui.label(RichText::new(human_size(tree.node(self.tm_root).size)).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut age = by_age;
+                ui.selectable_value(&mut age, true, "по дате");
+                ui.selectable_value(&mut age, false, "по типу");
+                ui.label(RichText::new("Цвет:").weak());
+                if age != by_age {
+                    self.settings.color_by_age = age;
+                    self.settings.save();
+                }
+            });
         });
         if let Some(c) = goto {
             self.tm_root = c;
         }
 
-        // legend: largest types, click to highlight
         let legend_h = 26.0;
         let avail = ui.available_size();
         let (resp, painter) = ui.allocate_painter(vec2(avail.x, (avail.y - legend_h).max(50.0)), Sense::click());
         let area = resp.rect;
         painter.rect_filled(area, 6.0, ui.visuals().extreme_bg_color);
-        if self
-            .tm
-            .as_ref()
-            .is_none_or(|c| c.root != self.tm_root || c.size != area.size())
-        {
+        let stale = self.tm.as_ref().is_none_or(|c| {
+            c.root != self.tm_root || c.size != area.size() || c.by_age != by_age || c.generation != self.generation
+        });
+        if stale {
+            if let Some(old) = self.tm.take()
+                && old.root != self.tm_root
+                && old.generation == self.generation
+            {
+                self.start_zoom(tree, &old, area.size());
+            }
             let rects = treemap::layout(tree, self.tm_root, Rect::from_min_size(Pos2::ZERO, area.size()));
             let exts: Vec<String> = rects
                 .iter()
@@ -375,11 +547,14 @@ impl App {
                     }
                 })
                 .collect();
+            let now = now_unix();
             let colors = rects
                 .iter()
                 .zip(&exts)
                 .map(|(r, e)| {
-                    if tree.is_dir(r.id) {
+                    if by_age {
+                        theme::age_color(tree.node(r.id).mtime, now)
+                    } else if tree.is_dir(r.id) {
                         theme::DIR_TILE
                     } else {
                         ext_color(e)
@@ -389,26 +564,59 @@ impl App {
             self.tm = Some(TmCache {
                 root: self.tm_root,
                 size: area.size(),
+                by_age,
+                generation: self.generation,
                 rects,
                 colors,
                 exts,
             });
         }
         let cache = self.tm.take().unwrap();
+
+        // zoom transition: map the layout into a rect that animates towards the full area
+        let t = self
+            .tm_anim
+            .as_ref()
+            .map(|a| ease_out(a.start.elapsed().as_secs_f32() / ZOOM_SECS))
+            .unwrap_or(1.0);
+        let full = Rect::from_min_size(Pos2::ZERO, area.size());
+        let frame = match &self.tm_anim {
+            Some(a) if t < 1.0 => Rect::from_min_max(a.from.min.lerp(full.min, t), a.from.max.lerp(full.max, t)),
+            _ => {
+                self.tm_anim = None;
+                full
+            }
+        };
+        let animating = self.tm_anim.is_some();
+        let (sx, sy) = (frame.width() / full.width(), frame.height() / full.height());
+        let map = |r: Rect| {
+            Rect::from_min_max(
+                area.min + vec2(frame.min.x + r.min.x * sx, frame.min.y + r.min.y * sy),
+                area.min + vec2(frame.min.x + r.max.x * sx, frame.min.y + r.max.y * sy),
+            )
+        };
+        let painter = painter.with_clip_rect(area);
+
         let off = area.min.to_vec2();
-        let hover = resp
-            .hover_pos()
-            .and_then(|p| treemap::hit(&cache.rects, p - off))
-            .map(|r| r.id);
+        let hover = if animating {
+            None
+        } else {
+            resp.hover_pos()
+                .and_then(|p| treemap::hit(&cache.rects, p - off))
+                .map(|r| r.id)
+        };
 
         // All leaf tiles go into one mesh with a light-to-dark diagonal gradient.
         let mut mesh = egui::Mesh::default();
         let mut labels: Vec<(Rect, NodeId, bool)> = Vec::new();
-        let frame = Color32::from_gray(if ui.visuals().dark_mode { 70 } else { 150 });
+        let frame_col = Color32::from_gray(if ui.visuals().dark_mode { 70 } else { 150 });
         for (k, r) in cache.rects.iter().enumerate() {
-            let rect = r.rect.translate(off);
+            let rect = map(r.rect);
+            if !rect.intersects(area) {
+                continue;
+            }
             if r.nested {
-                painter.rect_stroke(rect, 0.0, Stroke::new(1.0, frame), StrokeKind::Inside);
+                painter.rect_stroke(rect, 0.0, Stroke::new(1.0, frame_col), StrokeKind::Inside);
                 if r.header {
                     labels.push((rect, r.id, true));
                 }
@@ -420,13 +628,13 @@ impl App {
             } else {
                 cache.colors[k]
             };
-            let t = rect.shrink(0.5);
+            let tr = rect.shrink(0.5);
             let (c0, c1, c2) = (shade(base, 1.18), shade(base, 0.72), shade(base, 0.95));
             let i = mesh.vertices.len() as u32;
-            mesh.colored_vertex(t.left_top(), c0);
-            mesh.colored_vertex(t.right_top(), c2);
-            mesh.colored_vertex(t.right_bottom(), c1);
-            mesh.colored_vertex(t.left_bottom(), c2);
+            mesh.colored_vertex(tr.left_top(), c0);
+            mesh.colored_vertex(tr.right_top(), c2);
+            mesh.colored_vertex(tr.right_bottom(), c1);
+            mesh.colored_vertex(tr.left_bottom(), c2);
             mesh.add_triangle(i, i + 1, i + 2);
             mesh.add_triangle(i, i + 2, i + 3);
             if rect.width() > 60.0 && rect.height() > 16.0 && !dim {
@@ -439,6 +647,7 @@ impl App {
         } else {
             Color32::from_gray(40)
         };
+        let label_alpha = if animating { t * t } else { 1.0 };
         for (rect, id, folder) in labels {
             let (pos, color) = if folder {
                 (rect.min + vec2(3.0, 1.0), folder_text)
@@ -450,15 +659,19 @@ impl App {
                 Align2::LEFT_TOP,
                 tree.name(id),
                 FontId::proportional(11.0),
-                color,
+                color.gamma_multiply(label_alpha),
             );
         }
-        for (id, c) in [(self.selected, Color32::WHITE), (hover, Color32::YELLOW)] {
-            if let Some(id) = id
-                && let Some(r) = cache.rects.iter().find(|r| r.id == id)
-            {
-                painter.rect_stroke(r.rect.translate(off), 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
+        if !animating {
+            for (id, c) in [(self.selected, Color32::WHITE), (hover, Color32::YELLOW)] {
+                if let Some(id) = id
+                    && let Some(r) = cache.rects.iter().find(|r| r.id == id)
+                {
+                    painter.rect_stroke(map(r.rect), 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
+                }
             }
+        } else {
+            ui.ctx().request_repaint();
         }
         if cache.rects.is_empty() {
             painter.text(
@@ -505,7 +718,7 @@ impl App {
         }
         let back =
             ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1) || i.key_pressed(egui::Key::Backspace));
-        if back && resp.hovered() {
+        if back && resp.hovered() && !ui.ctx().egui_wants_keyboard_input() {
             self.tm_up();
         }
         if let Some(a) = act {
@@ -514,6 +727,16 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            if by_age {
+                let now = now_unix();
+                for (label, days) in theme::AGE_LEGEND {
+                    let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(r, 3.0, theme::age_color(now - days * 86_400, now));
+                    ui.label(label);
+                }
+                return;
+            }
             for t in data.types.iter().take(10) {
                 let on = self.highlight_ext.as_deref() == Some(t.ext.as_str());
                 let name = if t.ext.is_empty() {
@@ -550,8 +773,17 @@ impl App {
     pub fn types_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let total = data.out.tree.root_stats().0.max(1) as f64;
-        let max = data.types.first().map_or(1, |t| t.size.max(1)) as f32;
-        let types = &data.types;
+        let max = data.types.iter().map(|t| t.size).max().unwrap_or(1).max(1) as f32;
+        let mut order: Vec<usize> = (0..data.types.len()).collect();
+        let (key, desc) = self.types_sort;
+        match key {
+            TypeSort::Size => {}
+            TypeSort::Count => order.sort_by_key(|&i| std::cmp::Reverse(data.types[i].count)),
+            TypeSort::Name => order.sort_by(|&a, &b| data.types[a].ext.cmp(&data.types[b].ext)),
+        }
+        if (key != TypeSort::Name) != desc {
+            order.reverse();
+        }
         ui.label(
             RichText::new("Нажмите на тип, чтобы подсветить его файлы в treemap; двойной щелчок — перейти к обзору.")
                 .weak(),
@@ -560,30 +792,41 @@ impl App {
         let width = ui.available_width();
         let weak = ui.visuals().weak_text_color();
         let text_col = ui.visuals().text_color();
-        let (hdr, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+        let (hdr, hresp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
         let p = ui.painter_at(hdr);
-        let cols = [(90.0, "Файлов"), (70.0, "%"), (100.0, "На диске"), (100.0, "Размер")];
-        let mut x = hdr.right();
-        for (w, t) in cols {
-            cell(&p, x, hdr.center().y, t, weak);
-            x -= w;
+        let r = |x0: f32, x1: f32| Rect::from_min_max(pos2(x0, hdr.top()), pos2(x1, hdr.bottom()));
+        let right = hdr.right();
+        let mut st = self.types_sort;
+        let mut clicked = None;
+        for (rect, k, label, right_align) in [
+            (r(right - 90.0, right), TypeSort::Count, "Файлов", true),
+            (r(right - 360.0, right - 260.0), TypeSort::Size, "Размер", true),
+            (
+                r(hdr.left() + 22.0, hdr.left() + 200.0),
+                TypeSort::Name,
+                "Расширение",
+                false,
+            ),
+        ] {
+            if header(&p, &hresp, rect, label, right_align, (st.0 == k).then_some(st.1)) {
+                clicked = Some(k);
+            }
         }
-        p.text(
-            pos2(hdr.left() + 30.0, hdr.center().y),
-            Align2::LEFT_CENTER,
-            "Расширение",
-            font(),
-            weak,
-        );
+        header(&p, &hresp, r(right - 160.0, right - 90.0), "%", true, None);
+        header(&p, &hresp, r(right - 260.0, right - 160.0), "На диске", true, None);
+        if let Some(k) = clicked {
+            toggle_sort(&mut st, k, TypeSort::Name);
+            self.types_sort = st;
+        }
         let mut pick = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show_rows(ui, ROW_H, types.len(), |ui, range| {
+            .show_rows(ui, ROW_H, order.len(), |ui, range| {
                 for i in range {
-                    let t = &types[i];
+                    let t = &data.types[order[i]];
                     let on = self.highlight_ext.as_deref() == Some(t.ext.as_str());
-                    let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
-                    row_bg(ui, rect, on, resp.hovered(), i);
+                    let (rect, resp, hover) = row(ui, ROW_H, ("type", &t.ext));
+                    row_bg(ui, rect, on, hover, i);
                     let p = ui.painter_at(rect);
                     let y = rect.center().y;
                     p.rect_filled(
@@ -629,30 +872,46 @@ impl App {
     pub fn top_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
+        let key = (self.top_sort.0, self.top_sort.1, self.generation);
+        if self.top_order_key != Some(key) {
+            self.top_order = data.top.clone();
+            sort_list(tree, &mut self.top_order, self.top_sort);
+            self.top_order_key = Some(key);
+        }
         let width = ui.available_width();
         let weak = ui.visuals().weak_text_color();
         let text_col = ui.visuals().text_color();
-        let (hdr, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+        let (hdr, hresp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
         let p = ui.painter_at(hdr);
-        cell(&p, hdr.left() + 100.0, hdr.center().y, "Размер", weak);
-        cell(&p, hdr.left() + 200.0, hdr.center().y, "Изменён", weak);
-        p.text(
-            pos2(hdr.left() + 216.0, hdr.center().y),
-            Align2::LEFT_CENTER,
-            "Путь",
-            font(),
-            weak,
-        );
+        let r = |x0: f32, x1: f32| {
+            Rect::from_min_max(pos2(hdr.left() + x0, hdr.top()), pos2(hdr.left() + x1, hdr.bottom()))
+        };
+        let mut st = self.top_sort;
+        let mut clicked = None;
+        for (rect, k, label, right) in [
+            (r(0.0, 100.0), ListSort::Size, "Размер", true),
+            (r(100.0, 200.0), ListSort::Modified, "Изменён", true),
+            (r(208.0, 420.0), ListSort::Name, "Имя / путь", false),
+        ] {
+            if header(&p, &hresp, rect, label, right, (st.0 == k).then_some(st.1)) {
+                clicked = Some(k);
+            }
+        }
+        if let Some(k) = clicked {
+            toggle_sort(&mut st, k, ListSort::Name);
+            self.top_sort = st;
+        }
         let mut act = None;
         let selected = self.selected;
+        let order = &self.top_order;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show_rows(ui, ROW_H, data.top.len(), |ui, range| {
+            .show_rows(ui, ROW_H, order.len(), |ui, range| {
                 for i in range {
-                    let id = data.top[i];
+                    let id = order[i];
                     let nd = tree.node(id);
-                    let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
-                    row_bg(ui, rect, selected == Some(id), resp.hovered(), i);
+                    let (rect, resp, hover) = row(ui, ROW_H, ("top", id));
+                    row_bg(ui, rect, selected == Some(id), hover, i);
                     let p = ui.painter_at(rect);
                     let y = rect.center().y;
                     cell(&p, rect.left() + 100.0, y, human_size(nd.size), text_col);
@@ -677,6 +936,35 @@ impl App {
         }
     }
 
+    /// Bottom bar of the cleanup tab while items are ticked.
+    pub fn cleanup_bar(&mut self, ui: &mut Ui) {
+        let Some(data) = self.data.clone() else { return };
+        let tree = &data.out.tree;
+        let size: u64 = self.marked.iter().map(|&i| tree.node(i).size).sum();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Выбрано: {} · {}", self.marked.len(), human_size(size))).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ids: Vec<NodeId> = self.marked.iter().copied().collect();
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Удалить безвозвратно…").color(theme::REVIEW),
+                    ))
+                    .clicked()
+                {
+                    self.request_delete(ids.clone(), true);
+                }
+                if theme::primary_button(ui, "Удалить в корзину").clicked() {
+                    self.request_delete(ids, false);
+                }
+                if ui.button("Снять выделение").clicked() {
+                    self.marked.clear();
+                }
+            });
+        });
+        ui.add_space(2.0);
+    }
+
     pub fn cleanup_view(&mut self, ui: &mut Ui) {
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
@@ -692,8 +980,11 @@ impl App {
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                let shown = ui
+                    .ctx()
+                    .animate_value_with_time(Id::new("cleanup_total"), data.cleanup_total as f32, 0.5);
                 ui.label(
-                    RichText::new(format!("≈ {}", human_size(data.cleanup_total)))
+                    RichText::new(format!("≈ {}", human_size(shown as u64)))
                         .size(26.0)
                         .strong(),
                 );
@@ -701,9 +992,8 @@ impl App {
             });
             ui.label(
                 RichText::new(
-                    "Это подсказки по именам и расположению файлов. spacetree ничего не удаляет сам: \
-                     проверьте и удалите нужное через Проводник (правая кнопка › «Показать в Проводнике»). \
-                     Закройте программы, чей кэш чистите.",
+                    "Это подсказки по именам и расположению файлов. Отметьте нужное галочками и удалите кнопкой внизу \
+                     (по умолчанию — в корзину). Закройте программы, чей кэш чистите.",
                 )
                 .weak(),
             );
@@ -723,6 +1013,10 @@ impl App {
                         self.cleanup_show[k] = !self.cleanup_show[k];
                     }
                 }
+                ui.separator();
+                ui.label("Порядок:");
+                ui.selectable_value(&mut self.cleanup_by_size, false, "по надёжности");
+                ui.selectable_value(&mut self.cleanup_by_size, true, "по размеру");
             });
         });
         ui.add_space(8.0);
@@ -731,23 +1025,33 @@ impl App {
             return;
         }
 
+        let mut order: Vec<usize> = (0..data.cleanup.len()).collect();
+        if self.cleanup_by_size {
+            order.sort_by_key(|&i| std::cmp::Reverse(data.cleanup[i].size));
+        }
         let mut act = None;
-        let selected = self.selected;
+        let mut toggles: Vec<NodeId> = Vec::new();
+        let mut group_toggle: Option<(usize, bool)> = None;
+        let mut empty_bin = None;
         let weak = ui.visuals().weak_text_color();
         let text_col = ui.visuals().text_color();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (gi, g) in data.cleanup.iter().enumerate() {
+            for &gi in &order {
+                let g = &data.cleanup[gi];
                 let s = g.category.safety();
                 if !self.cleanup_show[levels.iter().position(|l| *l == s).unwrap()] {
                     continue;
                 }
                 let open = self.cleanup_open.contains(&gi);
+                let open_t = ui.ctx().animate_bool_with_time(Id::new(("cl_open", gi)), open, 0.18);
+                let deletable = g.category != Category::Hibernation;
+                let all_marked = deletable && g.items.iter().all(|i| self.marked.contains(i));
                 let header = theme::card(ui)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-                            disclosure(ui.painter(), r.center(), open, ui.visuals().weak_text_color());
+                            disclosure(ui.painter(), r.center(), open_t, weak);
                             theme::badge(ui, s.label(), theme::safety_color(s));
                             ui.label(RichText::new(g.category.title()).strong().size(14.5));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -755,64 +1059,88 @@ impl App {
                                 ui.label(
                                     RichText::new(format!("{} объектов · {} файлов", g.items.len(), g.files)).weak(),
                                 );
+                                if g.category == Category::RecycleBin {
+                                    if ui.small_button("Очистить корзину").clicked() {
+                                        empty_bin = Some(g.items.clone());
+                                    }
+                                } else if deletable {
+                                    let label = if all_marked {
+                                        "Снять все"
+                                    } else {
+                                        "Выбрать все"
+                                    };
+                                    if ui.small_button(label).clicked() {
+                                        group_toggle = Some((gi, !all_marked));
+                                    }
+                                }
                             });
                         });
                         ui.label(RichText::new(g.category.hint()).weak());
-                        if open {
-                            ui.add_space(4.0);
-                            let width = ui.available_width();
-                            for (i, &id) in g.items.iter().take(CLEANUP_ITEMS).enumerate() {
-                                let nd = tree.node(id);
-                                let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
-                                row_bg(ui, rect, selected == Some(id), resp.hovered(), i);
-                                let p = ui.painter_at(rect);
-                                let y = rect.center().y;
-                                cell(&p, rect.left() + 90.0, y, human_size(nd.size), text_col);
-                                cell(&p, rect.left() + 180.0, y, format_date(nd.mtime), weak);
-                                kind_icon(&p, tree, id, pos2(rect.left() + 190.0, y), text_col);
-                                let path_clip = Rect::from_min_max(rect.min, pos2(rect.right() - 84.0, rect.bottom()));
-                                ui.painter_at(path_clip).text(
-                                    pos2(rect.left() + 210.0, y),
-                                    Align2::LEFT_CENTER,
-                                    tree.path(id),
-                                    font(),
-                                    text_col,
-                                );
-                                let btn = Rect::from_center_size(pos2(rect.right() - 40.0, y), vec2(76.0, 20.0));
-                                let b = ui
-                                    .put(
-                                        btn,
-                                        egui::Button::new(RichText::new("В Проводнике").size(11.5))
-                                            .frame(resp.hovered()),
-                                    )
-                                    .on_hover_text("Показать в Проводнике");
-                                if b.clicked() {
-                                    act = Some(Action::Reveal(id));
-                                } else if resp.double_clicked() {
-                                    act = Some(Action::Show(id));
-                                } else if resp.clicked() {
-                                    act = Some(Action::Select(id));
+                        if open_t > 0.0 {
+                            ui.add_space(4.0 * open_t);
+                            ui.scope(|ui| {
+                                ui.multiply_opacity(open_t);
+                                for (i, &id) in g.items.iter().take(CLEANUP_ITEMS).enumerate() {
+                                    let nd = tree.node(id);
+                                    let (rect, resp, hover) = row(ui, ROW_H, ("cl_item", id));
+                                    let ticked = self.marked.contains(&id);
+                                    row_bg(ui, rect, self.selected == Some(id) || ticked, hover, i);
+                                    let p = ui.painter_at(rect);
+                                    let y = rect.center().y;
+                                    let mut x0 = rect.left();
+                                    if deletable && g.category != Category::RecycleBin {
+                                        tick(&p, pos2(x0 + 12.0, y), ticked, ui);
+                                        x0 += 24.0;
+                                    }
+                                    cell(&p, x0 + 90.0, y, human_size(nd.size), text_col);
+                                    cell(&p, x0 + 180.0, y, format_date(nd.mtime), weak);
+                                    kind_icon(&p, tree, id, pos2(x0 + 190.0, y), text_col);
+                                    let path_clip =
+                                        Rect::from_min_max(rect.min, pos2(rect.right() - 84.0, rect.bottom()));
+                                    ui.painter_at(path_clip).text(
+                                        pos2(x0 + 210.0, y),
+                                        Align2::LEFT_CENTER,
+                                        tree.path(id),
+                                        font(),
+                                        text_col,
+                                    );
+                                    let btn = Rect::from_center_size(pos2(rect.right() - 40.0, y), vec2(76.0, 20.0));
+                                    let b = ui
+                                        .put(
+                                            btn,
+                                            egui::Button::new(RichText::new("В Проводнике").size(11.5))
+                                                .frame(hover > 0.5),
+                                        )
+                                        .on_hover_text("Показать в Проводнике");
+                                    if b.clicked() {
+                                        act = Some(Action::Reveal(id));
+                                    } else if resp.double_clicked() {
+                                        act = Some(Action::Show(id));
+                                    } else if resp.clicked() {
+                                        if deletable && g.category != Category::RecycleBin {
+                                            toggles.push(id);
+                                        } else {
+                                            act = Some(Action::Select(id));
+                                        }
+                                    }
+                                    resp.context_menu(|ui| node_menu(ui, tree, id, &mut act));
                                 }
-                                resp.context_menu(|ui| node_menu(ui, tree, id, &mut act));
-                            }
-                            if g.items.len() > CLEANUP_ITEMS {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "…и ещё {} (показаны крупнейшие)",
-                                        g.items.len() - CLEANUP_ITEMS
-                                    ))
-                                    .weak(),
-                                );
-                            }
+                                if g.items.len() > CLEANUP_ITEMS {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "…и ещё {} (показаны крупнейшие; «Выбрать все» отметит и их)",
+                                            g.items.len() - CLEANUP_ITEMS
+                                        ))
+                                        .weak(),
+                                    );
+                                }
+                            });
                         }
                     })
                     .response;
                 // the header area (above the item list) toggles the group
-                let head = Rect::from_min_size(header.rect.min, vec2(header.rect.width(), 52.0));
-                if ui
-                    .interact(head, egui::Id::new(("cleanup", gi)), Sense::click())
-                    .clicked()
-                {
+                let head = Rect::from_min_size(header.rect.min, vec2((header.rect.width() - 330.0).max(80.0), 52.0));
+                if ui.interact(head, Id::new(("cleanup", gi)), Sense::click()).clicked() {
                     if open {
                         self.cleanup_open.remove(&gi);
                     } else {
@@ -822,6 +1150,27 @@ impl App {
                 ui.add_space(6.0);
             }
         });
+        for id in toggles {
+            if !self.marked.remove(&id) {
+                self.marked.insert(id);
+            }
+        }
+        if let Some((gi, on)) = group_toggle {
+            for &id in &data.cleanup[gi].items {
+                if on {
+                    self.marked.insert(id);
+                } else {
+                    self.marked.remove(&id);
+                }
+            }
+        }
+        if let Some(bins) = empty_bin {
+            self.request_empty_bin(bins);
+        }
+        let del = ui.input(|i| (i.key_pressed(Key::Delete), i.modifiers.shift));
+        if del.0 && !self.marked.is_empty() && self.delete.idle() && !ui.ctx().egui_wants_keyboard_input() {
+            self.request_delete(self.marked.iter().copied().collect(), del.1);
+        }
         if let Some(a) = act {
             self.apply(ui.ctx(), a);
         }

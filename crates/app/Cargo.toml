@@ -1,13 +1,24 @@
 [package]
 name = "spacetree-app"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+
+[[bin]]
+name = "SpaceTree"
+path = "src/main.rs"
 
 [dependencies]
 eframe = "0.36.2"
 rayon = "1.12.0"
 rfd = "0.17.2"
-spacetree-core = { version = "0.1.0", path = "../core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+spacetree-core = { version = "0.2.0", path = "../core" }
+ureq = "3.4.2"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+embed-resource = "3.0.12"

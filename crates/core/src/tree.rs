@@ -30,6 +30,8 @@ pub struct Node {
     pub mtime: u32,
     pub name_len: u16,
     pub kind: Kind,
+    /// Deleted after the scan (see [`Tree::remove`]): no longer listed and not counted anywhere.
+    pub removed: bool,
 }
 
 impl Node {
@@ -43,6 +45,7 @@ impl Node {
             mtime: 0,
             name_len,
             kind,
+            removed: false,
         }
     }
 }
@@ -51,6 +54,9 @@ pub struct Tree {
     nodes: Vec<Node>,
     names: String,
     child_start: Vec<u32>,
+    /// Number of live children; `remove` shrinks it, so a node's children are
+    /// `children[child_start[i]..child_start[i] + child_len[i]]`.
+    child_len: Vec<u32>,
     children: Vec<u32>,
     dir_count: u32,
 }
@@ -109,10 +115,12 @@ impl Tree {
         }
 
         Self::sort_children(&nodes, &child_start, &mut children);
+        let child_len = child_start.windows(2).map(|w| w[1] - w[0]).collect();
         Tree {
             nodes,
             names,
             child_start,
+            child_len,
             children,
             dir_count,
         }
@@ -193,8 +201,64 @@ impl Tree {
 
     /// Children sorted by size descending.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
-        let (s, e) = (self.child_start[id as usize], self.child_start[id as usize + 1]);
-        &self.children[s as usize..e as usize]
+        let s = self.child_start[id as usize] as usize;
+        &self.children[s..s + self.child_len[id as usize] as usize]
+    }
+
+    fn children_mut(&mut self, id: NodeId) -> &mut [NodeId] {
+        let s = self.child_start[id as usize] as usize;
+        &mut self.children[s..s + self.child_len[id as usize] as usize]
+    }
+
+    pub fn is_removed(&self, id: NodeId) -> bool {
+        self.nodes[id as usize].removed
+    }
+
+    /// Takes a deleted file or folder out of the tree: its subtree is marked removed, ancestors lose its
+    /// size / allocation / file count and are re-sorted among their siblings. Returns false for the root
+    /// or an already removed node.
+    pub fn remove(&mut self, id: NodeId) -> bool {
+        if id == ROOT || self.nodes[id as usize].removed {
+            return false;
+        }
+        let Node { size, alloc, files, .. } = self.nodes[id as usize];
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            let nd = &mut self.nodes[n as usize];
+            nd.removed = true;
+            if nd.kind == Kind::Dir {
+                self.dir_count -= 1;
+            }
+            stack.extend_from_slice(self.children(n));
+        }
+
+        let parent = self.nodes[id as usize].parent;
+        let siblings = self.children_mut(parent);
+        if let Some(pos) = siblings.iter().position(|&c| c == id) {
+            siblings[pos..].rotate_left(1);
+            self.child_len[parent as usize] -= 1;
+        }
+        let mut cur = parent;
+        loop {
+            let nd = &mut self.nodes[cur as usize];
+            nd.size -= size;
+            nd.alloc -= alloc;
+            nd.files -= files;
+            let Some(p) = self.parent(cur) else { break };
+            // `cur` shrank: move it right past siblings that are now larger (order: size desc, then id).
+            let nodes = &self.nodes;
+            let key = |c: NodeId| (std::cmp::Reverse(nodes[c as usize].size), c);
+            let s = self.child_start[p as usize] as usize;
+            let sib = &mut self.children[s..s + self.child_len[p as usize] as usize];
+            if let Some(mut i) = sib.iter().position(|&c| c == cur) {
+                while i + 1 < sib.len() && key(sib[i + 1]) < key(sib[i]) {
+                    sib.swap(i, i + 1);
+                    i += 1;
+                }
+            }
+            cur = p;
+        }
+        true
     }
 
     pub fn is_dir(&self, id: NodeId) -> bool {
@@ -286,6 +350,34 @@ mod tests {
         assert_eq!(t.children(root), &[f2, d, lnk]);
         assert_eq!(t.children(d), &[f1, f3]);
         assert_eq!(t.path(f3), format!("root{0}d{0}b.txt", std::path::MAIN_SEPARATOR));
+    }
+
+    #[test]
+    fn remove_updates_ancestors_order_and_counts() {
+        let mut b = Builder::default();
+        let root = b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
+        let a = b.add(root, "a", Kind::Dir, 0, 0);
+        let big = b.add(a, "big", Kind::File, 100, 100);
+        let small = b.add(a, "small", Kind::File, 5, 5);
+        let c = b.add(root, "c", Kind::Dir, 0, 0);
+        let inner = b.add(c, "inner", Kind::Dir, 0, 0);
+        b.add(inner, "f", Kind::File, 50, 50);
+        let mut t = b.finish();
+        assert_eq!(t.children(root), &[a, c]);
+        assert_eq!(t.dir_count(), 4);
+
+        assert!(t.remove(big));
+        assert_eq!(t.children(a), &[small]);
+        assert_eq!(t.node(a).size, 5);
+        assert_eq!(t.children(root), &[c, a], "a shrank below c and must move after it");
+        assert_eq!(t.root_stats(), (55, 55, 2));
+
+        assert!(t.remove(inner));
+        assert!(t.is_removed(inner) && t.children(c).is_empty());
+        assert_eq!(t.root_stats(), (5, 5, 1));
+        assert_eq!(t.dir_count(), 3);
+        assert!(!t.remove(inner), "already removed");
+        assert!(!t.remove(root), "the root cannot be removed");
     }
 
     #[test]

@@ -1,20 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chrome;
+mod delete;
+mod installer;
+mod settings;
 mod theme;
 mod treemap;
+mod update;
 mod views;
+mod winint;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense, Ui, vec2};
+use eframe::egui::{self, Color32, Key, Rect, Ui};
 use spacetree_core::cleanup::{self, Group};
-use spacetree_core::stats::{TypeStat, human_size, top_files, type_stats};
-use spacetree_core::{Backend, NodeId, Progress, ROOT, ScanError, ScanOutput, Used, export};
+use spacetree_core::stats::{TypeStat, top_files, type_stats};
+use spacetree_core::{Backend, NodeId, Progress, ROOT, ScanError, ScanOutput, Tree, Used, export};
+
+use settings::Settings;
 
 const TOP_N: usize = 1000;
 const SEARCH_LIMIT: usize = 5000;
@@ -30,6 +37,23 @@ pub struct Loaded {
     /// `(total, free)` of the scanned volume.
     pub disk: Option<(u64, u64)>,
     pub analysis: Duration,
+    pub root_path: PathBuf,
+}
+
+impl Loaded {
+    /// Recomputes the derived lists after the tree changed (deletions).
+    fn reanalyze(&mut self) {
+        let tree = &self.out.tree;
+        let ((top, types), groups) = rayon::join(
+            || rayon::join(|| top_files(tree, TOP_N), || type_stats(tree, ROOT)),
+            || cleanup::find(tree, now_unix()),
+        );
+        self.cleanup_total = groups.iter().map(|g| g.size).sum();
+        self.cleanup = groups;
+        self.top = top;
+        self.types = types;
+        self.disk = spacetree_core::disk_space(&self.root_path);
+    }
 }
 
 struct Job {
@@ -55,18 +79,42 @@ pub enum SortKey {
     Modified,
 }
 
+/// Sort order of flat lists (largest files, search results).
+#[derive(PartialEq, Clone, Copy)]
+pub enum ListSort {
+    Size,
+    Modified,
+    Name,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum TypeSort {
+    Size,
+    Count,
+    Name,
+}
+
 pub struct TmCache {
     pub root: NodeId,
     pub size: egui::Vec2,
+    pub by_age: bool,
+    /// Bumped by deletions so that the layout is recomputed.
+    pub generation: u64,
     pub rects: Vec<treemap::TmRect>,
     /// Per rect: fill color and lower-cased extension ("" for folders).
     pub colors: Vec<Color32>,
     pub exts: Vec<String>,
 }
 
-struct DriveInfo {
-    path: String,
-    space: Option<(u64, u64)>,
+/// Zoom transition of the treemap: the new layout grows from `from` (local coordinates) to the full area.
+pub struct TmAnim {
+    pub from: Rect,
+    pub start: Instant,
+}
+
+pub struct DriveInfo {
+    pub path: String,
+    pub space: Option<(u64, u64)>,
 }
 
 /// Something the user asked for from a row, a tile or a context menu; applied after drawing.
@@ -79,19 +127,51 @@ pub enum Action {
     Reveal(NodeId),
     Open(NodeId),
     CopyPath(NodeId),
+    Delete(NodeId, bool),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
+pub struct Toast {
+    pub text: String,
+    pub kind: ToastKind,
+    pub born: Instant,
+    /// Shown with a "restart" button and kept until dismissed.
+    pub restart: bool,
+}
+
+pub enum Mode {
+    App,
+    Install(installer::Install),
+    Uninstall(installer::Uninstall),
 }
 
 pub struct App {
-    path_text: String,
-    drives: Vec<DriveInfo>,
-    backend: Backend,
+    pub mode: Mode,
+    pub settings: Settings,
+    pub update: update::Shared,
+    update_reported: bool,
+    pub toasts: Vec<Toast>,
+    pub show_settings: bool,
+    pub icon: Option<egui::TextureHandle>,
+
+    pub path_text: String,
+    pub drives: Vec<DriveInfo>,
+    pub backend: Backend,
     /// Raw MFT reading works (Windows + administrator): scans of whole drives are much faster.
-    mft_ready: bool,
+    pub mft_ready: bool,
     auto_scan: bool,
     job: Option<Job>,
     pub data: Option<Arc<Loaded>>,
-    message: String,
-    status: Arc<Mutex<String>>,
+    /// Bumped whenever the tree changes after a scan.
+    pub generation: u64,
+    pub message: String,
+    pub status: Arc<Mutex<Option<(String, ToastKind)>>>,
     pub tab: Tab,
 
     pub selected: Option<NodeId>,
@@ -101,22 +181,32 @@ pub struct App {
     pub rows_dirty: bool,
     pub scroll_to: Option<usize>,
     pub tm: Option<TmCache>,
+    pub tm_anim: Option<TmAnim>,
     pub tm_menu: Option<NodeId>,
     pub highlight_ext: Option<String>,
     pub sort: SortKey,
     pub sort_desc: bool,
+    pub top_sort: (ListSort, bool),
+    pub top_order: Vec<NodeId>,
+    pub top_order_key: Option<(ListSort, bool, u64)>,
+    pub types_sort: (TypeSort, bool),
 
     pub search: String,
     search_done: String,
     search_edited: Option<Instant>,
     pub search_hits: Vec<NodeId>,
     pub search_truncated: bool,
+    pub search_sort: (ListSort, bool),
 
     pub cleanup_open: HashSet<usize>,
     pub cleanup_show: [bool; 3],
+    pub cleanup_by_size: bool,
+    /// Items ticked for deletion in the cleanup tab.
+    pub marked: HashSet<NodeId>,
+    pub delete: delete::DeleteState,
 }
 
-fn list_drives() -> Vec<DriveInfo> {
+pub fn list_drives() -> Vec<DriveInfo> {
     let paths: Vec<String> = if cfg!(windows) {
         ('A'..='Z')
             .map(|c| format!("{c}:\\"))
@@ -134,7 +224,7 @@ fn list_drives() -> Vec<DriveInfo> {
         .collect()
 }
 
-fn now_unix() -> u32 {
+pub fn now_unix() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
@@ -150,27 +240,63 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     }
 }
 
+/// The folder to scan, from the command line (Explorer passes it as `"%1"` / `"%V"`). A drive root comes
+/// as `"C:\"`, which Windows argument parsing turns into `C:"` — repair that.
+fn path_arg() -> Option<String> {
+    std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .map(|a| a.trim_matches('"').trim().to_owned())
+        .filter(|a| !a.is_empty())
+}
+
+pub fn sort_list(tree: &Tree, ids: &mut [NodeId], (key, desc): (ListSort, bool)) {
+    match key {
+        ListSort::Size => ids.sort_by_key(|&i| std::cmp::Reverse(tree.node(i).size)),
+        ListSort::Modified => ids.sort_by_key(|&i| std::cmp::Reverse(tree.node(i).mtime)),
+        ListSort::Name => ids.sort_by_cached_key(|&i| tree.name(i).to_lowercase()),
+    }
+    let natural_desc = key != ListSort::Name;
+    if natural_desc != desc {
+        ids.reverse();
+    }
+}
+
 impl App {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, mode: Mode) -> Self {
         theme::install(&cc.egui_ctx);
-        let drives = list_drives();
-        let arg = std::env::args().nth(1);
-        let mft_ready = cfg!(windows)
+        let icon = image_from_rgba(include_bytes!("../assets/icon64.rgba"), 64)
+            .map(|img| cc.egui_ctx.load_texture("icon", img, egui::TextureOptions::LINEAR));
+        let settings = Settings::load();
+        let in_app = matches!(mode, Mode::App);
+        let drives = if in_app { list_drives() } else { Vec::new() };
+        let arg = if in_app { path_arg() } else { None };
+        let mft_ready = in_app
+            && cfg!(windows)
             && drives.first().is_some_and(|d| {
                 spacetree_core::select_backend(std::path::Path::new(&d.path), Backend::Auto)
                     .is_ok_and(|s| s.used == Used::Mft)
             });
-        App {
+        let mut app = App {
+            mode,
+            update: Arc::new(Mutex::new(update::State::Idle)),
+            update_reported: false,
+            toasts: Vec::new(),
+            show_settings: false,
+            icon,
             path_text: arg
                 .clone()
+                .or_else(|| settings.recent.first().cloned())
                 .or_else(|| drives.first().map(|d| d.path.clone()))
                 .unwrap_or_default(),
+            settings,
             auto_scan: arg.is_some(),
             drives,
             backend: Backend::Auto,
             mft_ready,
             job: None,
             data: None,
+            generation: 0,
             message: String::new(),
             status: Arc::default(),
             tab: Tab::Overview,
@@ -181,29 +307,107 @@ impl App {
             rows_dirty: false,
             scroll_to: None,
             tm: None,
+            tm_anim: None,
             tm_menu: None,
             highlight_ext: None,
             sort: SortKey::Size,
             sort_desc: true,
+            top_sort: (ListSort::Size, true),
+            top_order: Vec::new(),
+            top_order_key: None,
+            types_sort: (TypeSort::Size, true),
             search: String::new(),
             search_done: String::new(),
             search_edited: None,
             search_hits: Vec::new(),
             search_truncated: false,
+            search_sort: (ListSort::Size, true),
             cleanup_open: HashSet::new(),
             cleanup_show: [true; 3],
+            cleanup_by_size: false,
+            marked: HashSet::new(),
+            delete: delete::DeleteState::default(),
+        };
+        if in_app {
+            update::cleanup_old();
+            if winint::running_installed() {
+                winint::refresh_installed_version();
+            }
+            app.maybe_check_updates(&cc.egui_ctx, false);
+        }
+        app
+    }
+
+    /// Release builds check GitHub for a new version at most every few hours (`force`: now).
+    pub fn maybe_check_updates(&mut self, ctx: &egui::Context, force: bool) {
+        let enabled = cfg!(not(debug_assertions)) || std::env::var_os("SPACETREE_UPDATE_DEBUG").is_some();
+        if !enabled && !force {
+            return;
+        }
+        let now = now_unix() as u64;
+        if !force && now.saturating_sub(self.settings.last_update_check) < update::CHECK_INTERVAL_SECS {
+            return;
+        }
+        self.settings.last_update_check = now;
+        self.settings.save();
+        self.update_reported = false;
+        let ctx = ctx.clone();
+        update::spawn(self.update.clone(), self.settings.auto_update, move || {
+            ctx.request_repaint()
+        });
+    }
+
+    pub fn toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+        self.toasts.push(Toast {
+            text: text.into(),
+            kind,
+            born: Instant::now(),
+            restart: false,
+        });
+    }
+
+    fn poll_update(&mut self) {
+        if self.update_reported {
+            return;
+        }
+        let state = self.update.lock().unwrap().clone();
+        match state {
+            update::State::Ready { version } => {
+                self.update_reported = true;
+                self.toasts.push(Toast {
+                    text: format!(
+                        "Обновление {version} установлено. Перезапустите SpaceTree, чтобы начать им пользоваться."
+                    ),
+                    kind: ToastKind::Success,
+                    born: Instant::now(),
+                    restart: true,
+                });
+            }
+            update::State::Available { version, .. } => {
+                self.update_reported = true;
+                self.toast(
+                    format!("Доступна новая версия {version} — откройте настройки ⚙"),
+                    ToastKind::Info,
+                );
+            }
+            update::State::Failed(e) => {
+                self.update_reported = true;
+                // a background check failing (offline etc.) is not worth a popup; settings show it
+                let _ = e;
+            }
+            _ => {}
         }
     }
 
-    fn start_scan(&mut self, ctx: &egui::Context) {
+    pub fn start_scan(&mut self, ctx: &egui::Context) {
         if self.job.is_some() {
             return;
         }
-        let mut text = self.path_text.trim().to_owned();
+        let mut text = self.path_text.trim().trim_matches('"').to_owned();
         if cfg!(windows) && text.len() == 2 && text.ends_with(':') {
             text.push('\\'); // `C:` alone means "current directory on C:"
-            self.path_text = text.clone();
         }
+        self.path_text = text.clone();
         let path = PathBuf::from(&text);
         let backend = self.backend;
         let progress = Arc::new(Progress::default());
@@ -212,20 +416,19 @@ impl App {
         std::thread::spawn(move || {
             let res = spacetree_core::scan(&path, backend, &p).map(|out| {
                 let t = Instant::now();
-                let tree = &out.tree;
-                let ((top, types), groups) = rayon::join(
-                    || rayon::join(|| top_files(tree, TOP_N), || type_stats(tree, ROOT)),
-                    || cleanup::find(tree, now_unix()),
-                );
-                Loaded {
-                    cleanup_total: groups.iter().map(|g| g.size).sum(),
-                    cleanup: groups,
-                    top,
-                    types,
-                    disk: spacetree_core::disk_space(&path),
-                    analysis: t.elapsed(),
+                let mut l = Loaded {
                     out,
-                }
+                    top: Vec::new(),
+                    types: Vec::new(),
+                    cleanup: Vec::new(),
+                    cleanup_total: 0,
+                    disk: None,
+                    analysis: Duration::ZERO,
+                    root_path: path,
+                };
+                l.reanalyze();
+                l.analysis = t.elapsed();
+                l
             });
             let _ = tx.send(res);
             ctx2.request_repaint();
@@ -243,18 +446,25 @@ impl App {
         let Some(job) = &self.job else { return };
         match job.rx.try_recv() {
             Ok(Ok(loaded)) => {
+                let path = job.path.clone();
                 self.data = Some(Arc::new(loaded));
                 self.job = None;
+                self.generation += 1;
                 self.selected = None;
                 self.tm_root = ROOT;
                 self.tm = None;
+                self.tm_anim = None;
                 self.expanded = HashSet::from([ROOT]);
                 self.rows_dirty = true;
                 self.search_done.clear();
                 self.search_hits.clear();
                 self.cleanup_open.clear();
+                self.marked.clear();
                 self.highlight_ext = None;
+                self.top_order_key = None;
                 self.drives = list_drives();
+                self.settings.push_recent(&path);
+                self.settings.save();
             }
             Ok(Err(e)) => {
                 self.message = e.to_string();
@@ -266,6 +476,26 @@ impl App {
                 self.job = None;
             }
         }
+    }
+
+    /// Called after nodes were removed from the tree.
+    pub fn tree_changed(&mut self) {
+        self.generation += 1;
+        let Some(data) = self.data.clone() else { return };
+        let tree = &data.out.tree;
+        if self.selected.is_some_and(|s| tree.is_removed(s)) {
+            self.selected = None;
+        }
+        while tree.is_removed(self.tm_root) {
+            self.tm_root = tree.parent(self.tm_root).unwrap_or(ROOT);
+        }
+        self.marked.retain(|&m| !tree.is_removed(m));
+        self.expanded.retain(|&e| !tree.is_removed(e));
+        self.tm = None;
+        self.tm_anim = None;
+        self.rows_dirty = true;
+        self.top_order_key = None;
+        self.search_done.clear(); // re-run the query on the changed tree
     }
 
     pub fn rebuild_rows(&mut self) {
@@ -343,7 +573,11 @@ impl App {
             }
             Action::Reveal(id) => reveal(&tree.path(id)),
             Action::Open(id) => open_path(&tree.path(id)),
-            Action::CopyPath(id) => ctx.copy_text(tree.path(id)),
+            Action::CopyPath(id) => {
+                ctx.copy_text(tree.path(id));
+                self.toast("Путь скопирован", ToastKind::Info);
+            }
+            Action::Delete(id, permanent) => self.request_delete(vec![id], permanent),
         }
     }
 
@@ -369,24 +603,37 @@ impl App {
         let tree = &data.out.tree;
         let mut hits: Vec<NodeId> = (1..tree.len() as NodeId)
             .into_par_iter()
-            .filter(|&i| contains_ci(tree.name(i), &q))
+            .filter(|&i| !tree.is_removed(i) && contains_ci(tree.name(i), &q))
             .collect();
         hits.par_sort_unstable_by_key(|&i| std::cmp::Reverse(tree.node(i).size));
         self.search_truncated = hits.len() > SEARCH_LIMIT;
         hits.truncate(SEARCH_LIMIT);
+        sort_list(tree, &mut hits, self.search_sort);
         self.search_hits = hits;
+    }
+
+    pub fn resort_search(&mut self) {
+        if let Some(data) = self.data.clone() {
+            sort_list(&data.out.tree, &mut self.search_hits, self.search_sort);
+        }
     }
 
     pub fn search_active(&self) -> bool {
         !self.search_done.is_empty()
     }
 
-    fn export_csv(&mut self, data: Arc<Loaded>) {
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.search_done.clear();
+        self.search_hits.clear();
+    }
+
+    pub fn export_csv(&mut self, data: Arc<Loaded>) {
         let Some(p) = rfd::FileDialog::new().set_file_name("spacetree.csv").save_file() else {
             return;
         };
         let status = self.status.clone();
-        *status.lock().unwrap() = "Экспорт CSV…".into();
+        self.toast("Экспорт CSV…", ToastKind::Info);
         std::thread::spawn(move || {
             let res = std::fs::File::create(&p)
                 .map(std::io::BufWriter::new)
@@ -394,330 +641,39 @@ impl App {
                     export::write_csv(&data.out.tree, &mut w)?;
                     std::io::Write::flush(&mut w)
                 });
-            *status.lock().unwrap() = match res {
-                Ok(()) => format!("CSV сохранён: {}", p.display()),
-                Err(e) => format!("Ошибка записи CSV: {e}"),
-            };
-        });
-    }
-
-    fn toolbar(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("◼ spacetree").strong().size(16.0).color(theme::ACCENT));
-            ui.add_space(8.0);
-            let scanning = self.job.is_some();
-            ui.add_enabled_ui(!scanning, |ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.path_text)
-                        .hint_text("Диск или папка")
-                        .desired_width(260.0),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    let ctx = ui.ctx().clone();
-                    self.start_scan(&ctx);
-                }
-                egui::ComboBox::from_id_salt("drives")
-                    .selected_text("Диски")
-                    .show_ui(ui, |ui| {
-                        for d in &self.drives {
-                            let label = match d.space {
-                                Some((t, f)) => format!("{}   свободно {} из {}", d.path, human_size(f), human_size(t)),
-                                None => d.path.clone(),
-                            };
-                            if ui.selectable_label(false, label).clicked() {
-                                self.path_text = d.path.clone();
-                            }
-                        }
-                    });
-                if ui.button("Папка…").on_hover_text("Выбрать папку").clicked()
-                    && let Some(p) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.path_text = p.to_string_lossy().into_owned();
-                }
-                egui::ComboBox::from_id_salt("backend")
-                    .selected_text(match self.backend {
-                        Backend::Auto => "Авто",
-                        Backend::Walk => "Обход папок",
-                        Backend::Mft => "MFT",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.backend, Backend::Auto, "Авто")
-                            .on_hover_text("MFT для целого NTFS-диска при правах администратора, иначе обход папок");
-                        ui.selectable_value(&mut self.backend, Backend::Walk, "Обход папок");
-                        ui.selectable_value(&mut self.backend, Backend::Mft, "MFT (только корень NTFS-диска)");
-                    })
-                    .response
-                    .on_hover_text("Способ сканирования");
-            });
-            if scanning {
-                if ui.button("⏹ Отмена").clicked()
-                    && let Some(j) = &self.job
-                {
-                    j.progress.cancel();
-                }
-            } else if theme::primary_button(ui, "▶ Сканировать").clicked() {
-                let ctx = ui.ctx().clone();
-                self.start_scan(&ctx);
-            }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(data) = self.data.clone() {
-                    if ui.button("⬇ CSV").on_hover_text("Экспорт всего дерева в CSV").clicked() {
-                        self.export_csv(data);
-                    }
-                    let id = egui::Id::new("search");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .id(id)
-                            .hint_text("🔍 Поиск по имени (Ctrl+F)")
-                            .desired_width(220.0),
-                    );
-                    if resp.changed() {
-                        self.search_edited = Some(Instant::now());
-                        self.tab = Tab::Overview;
-                    }
-                    if ui.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
-                        resp.request_focus();
-                    }
-                    if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
-                        self.search.clear();
-                    }
-                }
+            *status.lock().unwrap() = Some(match res {
+                Ok(()) => (format!("CSV сохранён: {}", p.display()), ToastKind::Success),
+                Err(e) => (format!("Ошибка записи CSV: {e}"), ToastKind::Error),
             });
         });
-        ui.add_space(2.0);
     }
 
-    fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            if let Some(d) = &self.data {
-                let (size, alloc, files) = d.out.tree.root_stats();
-                ui.label(format!(
-                    "Файлов: {files} · папок: {} · размер: {} · на диске: {}",
-                    d.out.tree.dir_count().saturating_sub(1),
-                    human_size(size),
-                    human_size(alloc),
-                ));
-                ui.separator();
-                let used = match d.out.selection.used {
-                    Used::Mft => "MFT",
-                    Used::Walk => "обход папок",
-                };
-                ui.label(format!("{used} · {:.2} с", d.out.elapsed.as_secs_f64()))
-                    .on_hover_text(format!(
-                        "Способ: {}\nАнализ после сканирования: {:.2} с",
-                        d.out.selection.reason,
-                        d.analysis.as_secs_f64()
-                    ));
-                if d.out.errors > 0 {
-                    ui.separator();
-                    ui.label(RichText::new(format!("⚠ нет доступа: {}", d.out.errors)).color(theme::LIKELY))
-                        .on_hover_text(
-                            d.out
-                                .error_samples
-                                .iter()
-                                .take(20)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
-                }
-            }
-            if !self.message.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, &self.message);
-            }
-            let st = self.status.lock().unwrap().clone();
-            if !st.is_empty() {
-                ui.label(st);
-            }
-            if let Some((total, free)) = self.data.as_ref().and_then(|d| d.disk) {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(100.0, 8.0), Sense::hover());
-                    theme::bar(ui, r, 1.0 - free as f32 / total.max(1) as f32, theme::ACCENT);
-                    ui.label(format!("Свободно {} из {}", human_size(free), human_size(total)));
-                });
-            }
-        });
-    }
-
-    fn welcome(&mut self, ui: &mut Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.12).max(16.0));
-            ui.label(RichText::new("Что занимает место?").size(26.0).strong());
-            ui.label(
-                RichText::new("Выберите диск или папку — spacetree покажет, куда ушло место и что можно удалить.")
-                    .weak(),
-            );
-        });
-        ui.add_space(20.0);
-
-        // drive cards, centered, wrapping into rows
-        let (card_w, card_h, gap) = (240.0, 84.0, 12.0);
-        let avail = ui.available_width();
-        let cols = (((avail + gap) / (card_w + gap)).floor() as usize).clamp(1, self.drives.len().max(1));
-        let rows = self.drives.len().div_ceil(cols);
-        let (area, _) = ui.allocate_exact_size(vec2(avail, rows as f32 * (card_h + gap)), Sense::hover());
-        let mut chosen = None;
-        for (i, d) in self.drives.iter().enumerate() {
-            let (row, col) = (i / cols, i % cols);
-            let in_row = (self.drives.len() - row * cols).min(cols) as f32;
-            let left = area.left() + (avail - in_row * (card_w + gap) + gap) / 2.0;
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    left + col as f32 * (card_w + gap),
-                    area.top() + row as f32 * (card_h + gap),
-                ),
-                vec2(card_w, card_h),
-            );
-            let resp = ui
-                .interact(rect, egui::Id::new(("drive", i)), Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Сканировать");
-            let v = ui.visuals();
-            let fill = if resp.hovered() {
-                v.widgets.hovered.weak_bg_fill
-            } else {
-                v.window_fill
-            };
-            let stroke = if resp.hovered() {
-                egui::Stroke::new(1.0, theme::ACCENT)
-            } else {
-                v.widgets.noninteractive.bg_stroke
-            };
-            let (text, weak) = (v.text_color(), v.weak_text_color());
-            let p = ui.painter();
-            p.rect(rect, 10.0, fill, stroke, egui::StrokeKind::Inside);
-            let inner = rect.shrink(14.0);
-            p.text(
-                inner.left_top(),
-                egui::Align2::LEFT_TOP,
-                &d.path,
-                egui::FontId::proportional(18.0),
-                text,
-            );
-            if let Some((total, free)) = d.space {
-                let frac = (total - free) as f32 / total.max(1) as f32;
-                let bar = egui::Rect::from_min_size(inner.left_top() + vec2(0.0, 28.0), vec2(inner.width(), 8.0));
-                theme::bar(ui, bar, frac, if frac > 0.9 { theme::REVIEW } else { theme::ACCENT });
-                ui.painter().text(
-                    inner.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("свободно {} из {}", human_size(free), human_size(total)),
-                    egui::FontId::proportional(12.5),
-                    weak,
-                );
-            }
-            if resp.clicked() {
-                chosen = Some(d.path.clone());
-            }
-        }
-
-        ui.vertical_centered(|ui| {
-            ui.add_space(6.0);
-            if ui.button("Выбрать папку…").clicked()
-                && let Some(p) = rfd::FileDialog::new().pick_folder()
-            {
-                chosen = Some(p.to_string_lossy().into_owned());
-            }
-            ui.add_space(24.0);
-            if cfg!(windows) && !self.mft_ready {
-                theme::card(ui).show(ui, |ui| {
-                    ui.set_max_width(560.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("⚡ Быстрый режим").strong().color(theme::LIKELY));
-                        ui.label(
-                            RichText::new(
-                                "Без прав администратора диск сканируется обходом папок. С правами администратора \
-                                 spacetree читает таблицу MFT напрямую — для целых дисков это обычно намного быстрее.",
-                            )
-                            .weak(),
-                        );
-                        ui.add_space(4.0);
-                        if ui.button("Перезапустить от администратора").clicked() {
-                            match relaunch_elevated(self.path_text.trim()) {
-                                Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-                                Err(e) => self.message = e,
-                            }
-                        }
-                    });
-                });
-            }
-        });
-        if let Some(p) = chosen {
-            self.path_text = p;
-            let ctx = ui.ctx().clone();
-            self.start_scan(&ctx);
-        }
-    }
-
-    fn scanning(&mut self, ui: &mut Ui) {
-        let Some(job) = &self.job else { return };
-        let p = &job.progress;
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.25).max(16.0));
-            ui.label(RichText::new(format!("Сканирование {}", job.path)).size(20.0).strong());
-            ui.add_space(12.0);
-            let building = p.phase.load(Relaxed) == spacetree_core::progress::PHASE_BUILDING;
-            let bar = match p.fraction() {
-                Some(f) if !building => egui::ProgressBar::new(f).show_percentage(),
-                _ => egui::ProgressBar::new(1.0).animate(true),
-            };
-            ui.add(bar.desired_width(420.0).text(if building {
-                "Построение дерева…"
-            } else {
-                ""
-            }));
-            ui.add_space(12.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} файлов · {} · {:.1} с",
-                    p.files.load(Relaxed),
-                    human_size(p.bytes.load(Relaxed)),
-                    job.started.elapsed().as_secs_f32()
-                ))
-                .size(15.0),
-            );
-            let errors = p.errors.load(Relaxed);
-            if errors > 0 {
-                ui.label(RichText::new(format!("нет доступа: {errors}")).weak());
-            }
-            ui.add_space(16.0);
-            if ui.button("⏹ Отмена").clicked() {
-                p.cancel();
-            }
-        });
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
-    }
-
-    fn tabs(&mut self, ui: &mut Ui) {
-        let Some(data) = self.data.clone() else { return };
-        ui.horizontal(|ui| {
-            let cleanup = format!("Можно удалить · {}", human_size(data.cleanup_total));
-            for (tab, label) in [
-                (Tab::Overview, "Обзор"),
-                (Tab::Types, "Типы файлов"),
-                (Tab::Top, "Крупнейшие файлы"),
-                (Tab::Cleanup, cleanup.as_str()),
-            ] {
-                if ui.add(egui::Button::selectable(self.tab == tab, label)).clicked() {
-                    self.tab = tab;
-                }
-            }
-        });
-    }
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn app_ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.poll_job();
+        self.poll_delete();
+        self.poll_update();
+        if let Some((text, kind)) = self.status.lock().unwrap().take() {
+            self.toasts.push(Toast {
+                text,
+                kind,
+                born: Instant::now(),
+                restart: false,
+            });
+        }
         if self.auto_scan {
             self.auto_scan = false;
             self.start_scan(&ctx);
         }
+        let typing = ctx.egui_wants_keyboard_input();
         if ctx.input(|i| i.key_pressed(Key::F5)) && self.data.is_some() {
             self.start_scan(&ctx);
+        }
+        if !typing && self.data.is_some() && self.delete.idle() && self.tab != Tab::Cleanup {
+            let (del, shift) = ctx.input(|i| (i.key_pressed(Key::Delete), i.modifiers.shift));
+            if del && let Some(id) = self.selected {
+                self.request_delete(vec![id], shift);
+            }
         }
         self.update_search(&ctx);
 
@@ -727,51 +683,64 @@ impl eframe::App for App {
         }
         if self.job.is_some() {
             egui::CentralPanel::default().show(ui, |ui| self.scanning(ui));
-            return;
-        }
-        if self.data.is_none() {
+        } else if self.data.is_none() {
             egui::CentralPanel::default().show(ui, |ui| {
                 if !self.message.is_empty() {
                     ui.colored_label(ui.visuals().error_fg_color, &self.message);
                 }
                 self.welcome(ui)
             });
-            return;
+        } else {
+            egui::Panel::top("tabs").show(ui, |ui| self.tabs(ui));
+            match self.tab {
+                Tab::Overview => {
+                    egui::Panel::left("tree")
+                        .resizable(true)
+                        .default_size(660.0)
+                        .min_size(320.0)
+                        .show(ui, |ui| {
+                            if self.search_active() {
+                                self.search_view(ui)
+                            } else {
+                                self.tree_view(ui)
+                            }
+                        });
+                    egui::CentralPanel::default().show(ui, |ui| self.treemap_view(ui));
+                }
+                Tab::Types => {
+                    egui::CentralPanel::default().show(ui, |ui| self.types_view(ui));
+                }
+                Tab::Top => {
+                    egui::CentralPanel::default().show(ui, |ui| self.top_view(ui));
+                }
+                Tab::Cleanup => {
+                    if !self.marked.is_empty() {
+                        egui::Panel::bottom("cleanup_bar").show(ui, |ui| self.cleanup_bar(ui));
+                    }
+                    egui::CentralPanel::default().show(ui, |ui| self.cleanup_view(ui));
+                }
+            }
         }
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.tabs(ui);
-            ui.add_space(2.0);
-        });
-        match self.tab {
-            Tab::Overview => {
-                egui::Panel::left("tree")
-                    .resizable(true)
-                    .default_size(660.0)
-                    .min_size(320.0)
-                    .show(ui, |ui| {
-                        if self.search_active() {
-                            self.search_view(ui)
-                        } else {
-                            self.tree_view(ui)
-                        }
-                    });
-                egui::CentralPanel::default().show(ui, |ui| self.treemap_view(ui));
-            }
-            Tab::Types => {
-                egui::CentralPanel::default().show(ui, |ui| self.types_view(ui));
-            }
-            Tab::Top => {
-                egui::CentralPanel::default().show(ui, |ui| self.top_view(ui));
-            }
-            Tab::Cleanup => {
-                egui::CentralPanel::default().show(ui, |ui| self.cleanup_view(ui));
-            }
+        self.delete_dialogs(&ctx);
+        self.settings_window(&ctx);
+        self.draw_toasts(&ctx);
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        match &self.mode {
+            Mode::App => self.app_ui(ui),
+            Mode::Install(_) | Mode::Uninstall(_) => self.installer_ui(ui),
         }
     }
 }
 
-fn reveal(path: &str) {
+fn image_from_rgba(bytes: &[u8], side: usize) -> Option<egui::ColorImage> {
+    (bytes.len() == side * side * 4).then(|| egui::ColorImage::from_rgba_unmultiplied([side, side], bytes))
+}
+
+pub fn reveal(path: &str) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -788,7 +757,7 @@ fn reveal(path: &str) {
     }
 }
 
-fn open_path(path: &str) {
+pub fn open_path(path: &str) {
     #[cfg(windows)]
     let _ = std::process::Command::new("explorer").arg(path).spawn();
     #[cfg(not(windows))]
@@ -796,7 +765,7 @@ fn open_path(path: &str) {
 }
 
 /// Starts this executable again through the UAC prompt, asking it to scan `path`.
-fn relaunch_elevated(path: &str) -> Result<(), String> {
+pub fn relaunch_elevated(path: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -836,12 +805,36 @@ fn relaunch_elevated(path: &str) -> Result<(), String> {
 }
 
 fn main() -> eframe::Result {
+    let mode = if std::env::args().any(|a| a == "--uninstall") {
+        Mode::Uninstall(installer::Uninstall::default())
+    } else if winint::is_setup_launch() {
+        Mode::Install(installer::Install::default())
+    } else {
+        Mode::App
+    };
+    let (size, min, title) = match mode {
+        Mode::App => ([1360.0, 860.0], [900.0, 560.0], "SpaceTree — анализ места на диске"),
+        Mode::Install(_) => ([560.0, 440.0], [560.0, 440.0], "Установка SpaceTree"),
+        Mode::Uninstall(_) => ([520.0, 300.0], [520.0, 300.0], "Удаление SpaceTree"),
+    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size(min)
+        .with_title(title)
+        .with_app_id("SpaceTree");
+    if let Some(img) = image_from_rgba(include_bytes!("../assets/icon64.rgba"), 64) {
+        viewport = viewport.with_icon(egui::IconData {
+            rgba: img.as_raw().to_vec(),
+            width: 64,
+            height: 64,
+        });
+    }
+    if !matches!(mode, Mode::App) {
+        viewport = viewport.with_resizable(false).with_maximize_button(false);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("spacetree — анализ места на диске"),
+        viewport,
         ..Default::default()
     };
-    eframe::run_native("spacetree", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("SpaceTree", opts, Box::new(|cc| Ok(Box::new(App::new(cc, mode)))))
 }

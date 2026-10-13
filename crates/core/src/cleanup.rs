@@ -45,11 +45,12 @@ pub enum Category {
     Hibernation,
     Backups,
     OldDownloads,
+    Duplicates,
     BigOld,
 }
 
 impl Category {
-    pub const ALL: [Category; 16] = [
+    pub const ALL: [Category; 17] = [
         Category::RecycleBin,
         Category::Temp,
         Category::BrowserCache,
@@ -65,6 +66,7 @@ impl Category {
         Category::Hibernation,
         Category::Backups,
         Category::OldDownloads,
+        Category::Duplicates,
         Category::BigOld,
     ];
 
@@ -85,6 +87,7 @@ impl Category {
             Category::Hibernation => "Файл гибернации",
             Category::Backups => "Резервные копии файлов",
             Category::OldDownloads => "Старые установщики и архивы в «Загрузках»",
+            Category::Duplicates => "Возможные дубликаты",
             Category::BigOld => "Крупные файлы, не менявшиеся больше года",
         }
     }
@@ -120,6 +123,9 @@ impl Category {
             }
             Category::Backups => "Файлы *.bak, *.old, *~. Убедитесь, что оригиналы на месте.",
             Category::OldDownloads => "Установщики и архивы старше 30 дней. Программы обычно уже установлены.",
+            Category::Duplicates => {
+                "Файлы от 1 МБ с одинаковыми именем и размером в разных папках. Самая новая копия сюда не входит.                  Содержимое не сравнивалось — проверьте перед удалением."
+            }
             Category::BigOld => "Файлы от 1 ГБ без изменений больше года (кроме системных папок). Решайте сами.",
         }
     }
@@ -138,7 +144,11 @@ impl Category {
             | Category::Logs
             | Category::PackageCache
             | Category::DevArtifacts => Safety::Likely,
-            Category::Hibernation | Category::Backups | Category::OldDownloads | Category::BigOld => Safety::Review,
+            Category::Hibernation
+            | Category::Backups
+            | Category::OldDownloads
+            | Category::Duplicates
+            | Category::BigOld => Safety::Review,
         }
     }
 }
@@ -156,6 +166,14 @@ const DAY: u32 = 86_400;
 const OLD_DOWNLOAD_AGE: u32 = 30 * DAY;
 const BIG_OLD_AGE: u32 = 365 * DAY;
 const BIG_OLD_SIZE: u64 = 1 << 30;
+/// Smallest file considered for the duplicates check.
+const DUP_MIN_SIZE: u64 = 1 << 20;
+/// Only personal content is checked for duplicates: copies of program files are usually intentional.
+const DUP_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "mp3", "flac", "wav", "m4a", "ogg", "aac", "jpg", "jpeg", "png",
+    "gif", "webp", "heic", "bmp", "tif", "tiff", "psd", "raw", "cr2", "nef", "arw", "dng", "pdf", "djvu", "epub",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "zip", "rar", "7z", "iso", "msi",
+];
 /// Groups smaller than this are noise (e.g. the `desktop.ini` of an empty recycle bin).
 const MIN_GROUP: u64 = 64 << 10;
 
@@ -336,6 +354,8 @@ struct Finder<'a> {
     tree: &'a Tree,
     now: u32,
     found: Vec<(Category, NodeId)>,
+    /// Files that may have copies elsewhere: (size, lower-cased name, node).
+    dup_candidates: Vec<(u64, String, NodeId)>,
 }
 
 impl Finder<'_> {
@@ -474,6 +494,7 @@ pub fn find(tree: &Tree, now: u32) -> Vec<Group> {
         tree,
         now,
         found: Vec::new(),
+        dup_candidates: Vec::new(),
     };
     let mut root = tree.name(crate::tree::ROOT).to_lowercase().replace('\\', "/");
     while root.len() > 1 && root.ends_with('/') {
@@ -519,11 +540,35 @@ pub fn find(tree: &Tree, now: u32) -> Vec<Group> {
                 Kind::File => {
                     if let Some(cat) = f.file_rule(c, &path, ctx) {
                         f.found.push((cat, c));
+                    } else if !ctx.in_system
+                        && tree.node(c).size >= DUP_MIN_SIZE
+                        && !path.contains("/appdata/")
+                        && !path.contains("/plugins/")
+                        && ext_is(tree.name(c), DUP_EXTS)
+                    {
+                        f.dup_candidates
+                            .push((tree.node(c).size, tree.name(c).to_lowercase(), c));
                     }
                 }
                 Kind::Link => {}
             }
         }
+    }
+
+    // Same size and name: keep the most recently modified copy, offer the others.
+    let mut cands = std::mem::take(&mut f.dup_candidates);
+    cands.sort_unstable();
+    for same in cands.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+        if same.len() < 2 {
+            continue;
+        }
+        let keep = same
+            .iter()
+            .max_by_key(|c| (tree.node(c.2).mtime, std::cmp::Reverse(c.2)))
+            .unwrap()
+            .2;
+        f.found
+            .extend(same.iter().filter(|c| c.2 != keep).map(|c| (Category::Duplicates, c.2)));
     }
 
     let mut groups: Vec<Group> = Category::ALL
@@ -608,10 +653,16 @@ mod tests {
         let pf = b.add(root, "Program Files", Kind::Dir, 0, 0);
         b.add(pf, "core.dll.bak", Kind::File, 90 * M, 4096);
         b.add(root, "tiny.tmp", Kind::File, 10, 4096); // below the group threshold
+        let pics = b.add(me, "Pictures", Kind::Dir, 0, 0);
+        let dup_old = b.add(pics, "Holiday.mp4", Kind::File, 600 * M, 4096);
+        let dup_new = b.add(dl, "holiday.mp4", Kind::File, 600 * M, 4096);
+        b.add(pics, "other.mp4", Kind::File, 601 * M, 4096);
         b.nodes[old as usize].mtime = NOW - 90 * DAY;
         b.nodes[new as usize].mtime = NOW - DAY;
         b.nodes[big as usize].mtime = NOW - 400 * DAY;
         b.nodes[sys_big as usize].mtime = NOW - 400 * DAY;
+        b.nodes[dup_old as usize].mtime = NOW - 10 * DAY;
+        b.nodes[dup_new as usize].mtime = NOW - DAY;
         b.finish()
     }
 
@@ -645,6 +696,7 @@ mod tests {
         assert_eq!(get(Category::BigOld), Some((2 << 30, vec!["video.mkv".into()])));
         assert_eq!(get(Category::RecycleBin).map(|g| g.0), Some(60 * M));
         assert_eq!(get(Category::Hibernation).map(|g| g.0), Some(8000 * M));
+        assert_eq!(get(Category::Duplicates), Some((600 * M, vec!["Holiday.mp4".into()])));
         assert_eq!(
             get(Category::TempFiles),
             None,
