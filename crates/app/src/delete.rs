@@ -19,6 +19,8 @@ pub struct Pending {
     pub permanent: bool,
     /// Empty the recycle bin instead of deleting nodes (the ids are the `$Recycle.Bin` folders).
     pub empty_bin: bool,
+    /// Replace the duplicates by hard links to the copy that is kept instead of deleting them.
+    pub link: bool,
     pub size: u64,
     pub system: bool,
 }
@@ -34,6 +36,8 @@ pub struct Running {
 struct Outcome {
     /// Nodes that are gone from disk.
     removed: Vec<NodeId>,
+    /// Duplicates that now share the data of the kept copy.
+    linked: Vec<NodeId>,
     failed: Vec<(String, String)>,
 }
 
@@ -97,12 +101,30 @@ impl App {
             ids,
             permanent,
             empty_bin: false,
+            link: false,
         };
         if !pending.permanent && !pending.system && !self.settings.confirm_delete {
             self.start_delete(pending);
         } else {
             self.delete.pending = Some(pending);
         }
+    }
+
+    /// Offers to replace the ticked duplicates by hard links to the copies that are kept.
+    pub fn request_hardlink(&mut self, ids: Vec<NodeId>) {
+        let Some(data) = self.data.clone() else { return };
+        let ids: Vec<NodeId> = ids.into_iter().filter(|i| data.dup_keep.contains_key(i)).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.delete.pending = Some(Pending {
+            size: ids.iter().map(|&i| data.out.tree.node(i).size).sum(),
+            ids,
+            permanent: false,
+            empty_bin: false,
+            link: true,
+            system: false,
+        });
     }
 
     pub fn request_empty_bin(&mut self, bins: Vec<NodeId>) {
@@ -112,6 +134,7 @@ impl App {
             ids: bins,
             permanent: true,
             empty_bin: true,
+            link: false,
             size,
             system: false,
         });
@@ -126,6 +149,11 @@ impl App {
         let tree = &data.out.tree;
         // (node, path, is the recycle-bin folder whose children go away)
         let jobs: Vec<(NodeId, String)> = p.ids.iter().map(|&i| (i, tree.path(i))).collect();
+        let keep_paths: Vec<String> = if p.link {
+            p.ids.iter().map(|i| tree.path(data.dup_keep[i])).collect()
+        } else {
+            Vec::new()
+        };
         let bin_children: Vec<NodeId> = if p.empty_bin {
             p.ids.iter().flat_map(|&b| tree.children(b).to_vec()).collect()
         } else {
@@ -136,13 +164,23 @@ impl App {
         let current = Arc::new(Mutex::new(String::new()));
         let total = jobs.len();
         let (d2, c2) = (done.clone(), current.clone());
-        let (permanent, empty_bin) = (p.permanent, p.empty_bin);
+        let (permanent, empty_bin, link) = (p.permanent, p.empty_bin, p.link);
         std::thread::spawn(move || {
             let mut out = Outcome {
                 removed: Vec::new(),
+                linked: Vec::new(),
                 failed: Vec::new(),
             };
-            if empty_bin {
+            if link {
+                for ((id, path), keep) in jobs.into_iter().zip(keep_paths) {
+                    *c2.lock().unwrap() = path.clone();
+                    match spacetree_core::dupes::replace_with_hardlink(keep.as_ref(), path.as_ref()) {
+                        Ok(()) => out.linked.push(id),
+                        Err(e) => out.failed.push((path, e.to_string())),
+                    }
+                    d2.fetch_add(1, Relaxed);
+                }
+            } else if empty_bin {
                 match winint::empty_recycle_bin() {
                     Ok(()) => out.removed = bin_children,
                     Err(e) => out.failed.push(("Корзина".into(), e)),
@@ -189,8 +227,9 @@ impl App {
             match r.rx.try_recv() {
                 Ok(o) => {
                     crate::diag::info(format!(
-                        "delete finished: {} removed, {} failed",
+                        "delete finished: {} removed, {} linked, {} failed",
                         o.removed.len(),
+                        o.linked.len(),
                         o.failed.len()
                     ));
                     for (path, why) in &o.failed {
@@ -213,6 +252,24 @@ impl App {
             self.delete.waiting = Some(outcome); // a background reader still holds the tree; retry next frame
             return;
         };
+        let mut link_toast = None;
+        if !outcome.linked.is_empty() {
+            let linked: std::collections::HashSet<NodeId> = outcome.linked.iter().copied().collect();
+            let saved: u64 = linked.iter().map(|&i| data.out.tree.node(i).size).sum();
+            if let Some(sets) = &mut data.dup_sets {
+                for s in sets.iter_mut() {
+                    s.items.retain(|i| !linked.contains(i));
+                }
+                sets.retain(|s| s.items.len() > 1);
+            }
+            data.merge_dups();
+            data.disk = spacetree_core::disk_space(&data.root_path);
+            link_toast = Some(format!(
+                "Заменено жёсткими ссылками: {} · освобождено {}",
+                outcome.linked.len(),
+                human_size(saved)
+            ));
+        }
         let before = data.out.tree.root_stats().0;
         for &id in &outcome.removed {
             data.out.tree.remove(id);
@@ -222,6 +279,9 @@ impl App {
             data.reanalyze();
         }
         self.tree_changed();
+        if let Some(t) = link_toast {
+            self.toast(t, ToastKind::Success);
+        }
         if !outcome.removed.is_empty() {
             self.toast(
                 format!(
@@ -271,6 +331,8 @@ impl App {
             ui.set_width(480.0);
             let title = if p.empty_bin {
                 "Очистить корзину?".to_owned()
+            } else if p.link {
+                format!("Заменить копии жёсткими ссылками ({})?", p.ids.len())
             } else if p.ids.len() == 1 {
                 format!("Удалить «{}»?", tree.name(p.ids[0]))
             } else {
@@ -293,7 +355,13 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
-                ui.checkbox(&mut p.permanent, "Удалить безвозвратно, минуя корзину");
+                if p.link {
+                    ui.label(
+                        "Все имена файлов останутся на местах, программы подмены не заметят, но на диске                          будет храниться одна копия данных. Права и атрибуты копий станут как у сохраняемого файла;                          изменение одного из файлов изменит и остальные. Работает только в пределах одного NTFS-тома.",
+                    );
+                } else {
+                    ui.checkbox(&mut p.permanent, "Удалить безвозвратно, минуя корзину");
+                }
             }
             if p.system {
                 ui.label(
@@ -304,7 +372,8 @@ impl App {
                     .color(theme::REVIEW),
                 );
             }
-            if p.permanent {
+            if p.link {
+            } else if p.permanent {
                 ui.label(RichText::new("Восстановить файлы после этого будет нельзя.").color(theme::REVIEW));
             } else if !p.empty_bin {
                 ui.label(RichText::new("Файлы попадут в корзину — их можно будет восстановить.").weak());
@@ -313,6 +382,8 @@ impl App {
             ui.horizontal(|ui| {
                 let label = if p.empty_bin {
                     "Очистить"
+                } else if p.link {
+                    "Заменить ссылками"
                 } else if p.permanent {
                     "Удалить навсегда"
                 } else {

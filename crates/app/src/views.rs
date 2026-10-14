@@ -946,6 +946,14 @@ impl App {
             ui.label(RichText::new(format!("Выбрано: {} · {}", self.marked.len(), human_size(size))).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ids: Vec<NodeId> = self.marked.iter().copied().collect();
+                if ids.iter().all(|i| data.dup_keep.contains_key(i))
+                    && ui
+                        .button("В жёсткие ссылки…")
+                        .on_hover_text("Оставить имена на местах, но хранить одну копию данных (CreateHardLink)")
+                        .clicked()
+                {
+                    self.request_hardlink(ids.clone());
+                }
                 if ui
                     .add(egui::Button::new(
                         RichText::new("Удалить безвозвратно…").color(theme::REVIEW),
@@ -1028,7 +1036,7 @@ impl App {
                 if let Some((stage, done, total, bytes, elapsed)) = dup_progress {
                     let step = match stage {
                         spacetree_core::dupes::STAGE_SIZES => "сравнение размеров",
-                        spacetree_core::dupes::STAGE_PARTIAL => "хеш начала файлов",
+                        spacetree_core::dupes::STAGE_PARTIAL => "хеш начала, середины и конца",
                         _ => "полный хеш",
                     };
                     ui.add(egui::Spinner::new());
@@ -1101,7 +1109,7 @@ impl App {
                 }
                 let open = self.cleanup_open.contains(&gi);
                 let open_t = ui.ctx().animate_bool_with_time(Id::new(("cl_open", gi)), open, 0.18);
-                let deletable = g.category != Category::Hibernation;
+                let deletable = !matches!(g.category, Category::Hibernation | Category::VirtualDisks);
                 let all_marked = deletable && g.items.iter().all(|i| self.marked.contains(i));
                 let header = theme::card(ui)
                     .show(ui, |ui| {

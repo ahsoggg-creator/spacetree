@@ -42,6 +42,9 @@ pub enum Category {
     Logs,
     PackageCache,
     DevArtifacts,
+    DriverInstallers,
+    AiModels,
+    VirtualDisks,
     Hibernation,
     Backups,
     OldDownloads,
@@ -50,7 +53,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 17] = [
+    pub const ALL: [Category; 20] = [
         Category::RecycleBin,
         Category::Temp,
         Category::BrowserCache,
@@ -63,6 +66,9 @@ impl Category {
         Category::Logs,
         Category::PackageCache,
         Category::DevArtifacts,
+        Category::DriverInstallers,
+        Category::AiModels,
+        Category::VirtualDisks,
         Category::Hibernation,
         Category::Backups,
         Category::OldDownloads,
@@ -84,6 +90,9 @@ impl Category {
             Category::Logs => "Журналы (логи)",
             Category::PackageCache => "Кэш менеджеров пакетов",
             Category::DevArtifacts => "Зависимости и артефакты сборки",
+            Category::DriverInstallers => "Распакованные установщики драйверов",
+            Category::AiModels => "Локальные ИИ-модели",
+            Category::VirtualDisks => "Виртуальные диски Docker и WSL",
             Category::Hibernation => "Файл гибернации",
             Category::Backups => "Резервные копии файлов",
             Category::OldDownloads => "Старые установщики и архивы в «Загрузках»",
@@ -118,6 +127,15 @@ impl Category {
             Category::DevArtifacts => {
                 "node_modules, target, bin/obj, __pycache__ и т. п. Восстанавливаются сборкой проекта (npm install, cargo build…)."
             }
+            Category::DriverInstallers => {
+                "Папки C:/NVIDIA и C:/AMD:распакованные установщики драйверов видеокарты. Установленный драйвер от них не зависит."
+            }
+            Category::AiModels => {
+                "Модели Ollama и LM Studio. Скачаются заново, но это десятки гигабайт трафика — удаляйте ненужные модели."
+            }
+            Category::VirtualDisks => {
+                "Не удаляйте: внутри данные Docker/WSL. Диск только растёт — сожмите его: wsl --shutdown, затем от                  администратора diskpart › select vdisk file=\"путь\" › attach vdisk readonly › compact vdisk › detach vdisk                  (или Optimize-VHD -Path путь -Mode Full)."
+            }
             Category::Hibernation => {
                 "Удаляется только отключением гибернации: powercfg /h off (от администратора). Пропадёт быстрый запуск."
             }
@@ -143,8 +161,11 @@ impl Category {
             | Category::TempFiles
             | Category::Logs
             | Category::PackageCache
-            | Category::DevArtifacts => Safety::Likely,
-            Category::Hibernation
+            | Category::DevArtifacts
+            | Category::DriverInstallers => Safety::Likely,
+            Category::AiModels
+            | Category::VirtualDisks
+            | Category::Hibernation
             | Category::Backups
             | Category::OldDownloads
             | Category::Duplicates
@@ -234,6 +255,14 @@ const DIR_SUFFIXES: &[(&str, Category)] = &[
     ("/appdata/local/pypoetry/cache", Category::PackageCache),
     ("/appdata/local/uv/cache", Category::PackageCache),
     ("/.cargo/registry/cache", Category::PackageCache),
+    ("/.nuget/packages", Category::PackageCache),
+    ("/appdata/local/pnpm/store", Category::PackageCache),
+    ("/appdata/local/composer", Category::PackageCache),
+    ("/appdata/local/vcpkg/archives", Category::PackageCache),
+    ("/.ollama/models", Category::AiModels),
+    ("/.lmstudio/models", Category::AiModels),
+    ("/steamapps/shadercache", Category::AppCache),
+    ("/programdata/nvidia corporation/nv_cache", Category::AppCache),
     ("/.cargo/registry/src", Category::PackageCache),
     ("/appdata/local/nuget/v3-cache", Category::PackageCache),
     ("/appdata/local/yarn/cache", Category::PackageCache),
@@ -253,6 +282,8 @@ const VOLUME_DIRS: &[(&str, Category)] = &[
     ("windows.old", Category::OldWindows),
     ("$windows.~bt", Category::OldWindows),
     ("$windows.~ws", Category::OldWindows),
+    ("nvidia", Category::DriverInstallers),
+    ("amd", Category::DriverInstallers),
 ];
 /// System folders where the walk does not look for loose files to delete.
 const SKIP_UNDER_VOLUME: &[&str] = &[
@@ -445,6 +476,9 @@ impl Finder<'_> {
             && path.ends_with("/microsoft/windows/explorer")
         {
             return Some(Category::Thumbnails);
+        }
+        if name.eq_ignore_ascii_case("docker_data.vhdx") || name.eq_ignore_ascii_case("ext4.vhdx") {
+            return Some(Category::VirtualDisks);
         }
         if ext_is(name, &["dmp", "mdmp", "hdmp"]) {
             return Some(Category::CrashDumps);
@@ -751,6 +785,31 @@ mod tests {
         // safest groups come first
         let order: Vec<Safety> = got.iter().map(|g| g.0.safety()).collect();
         assert!(order.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn finds_ai_models_virtual_disks_and_driver_installers() {
+        let mut b = Builder::default();
+        let root = b.add(NO_PARENT, "C:\\", Kind::Dir, 0, 0);
+        let me = b.add(root, "Users", Kind::Dir, 0, 0);
+        let me = b.add(me, "me", Kind::Dir, 0, 0);
+        let models = b.add(me, ".ollama", Kind::Dir, 0, 0);
+        let models = b.add(models, "models", Kind::Dir, 0, 0);
+        b.add(models, "blob", Kind::File, 5000 * M, 4096);
+        let nuget = b.add(me, ".nuget", Kind::Dir, 0, 0);
+        let nuget = b.add(nuget, "packages", Kind::Dir, 0, 0);
+        b.add(nuget, "x.nupkg", Kind::File, 200 * M, 4096);
+        let docker = b.add(me, "docker", Kind::Dir, 0, 0);
+        b.add(docker, "Docker_Data.vhdx", Kind::File, 9000 * M, 9000 * M);
+        let nv = b.add(root, "NVIDIA", Kind::Dir, 0, 0);
+        b.add(nv, "setup.exe", Kind::File, 800 * M, 4096);
+        let t = b.finish();
+        let got = sizes(&t);
+        let get = |c: Category| got.iter().find(|g| g.0 == c).map(|g| g.1);
+        assert_eq!(get(Category::AiModels), Some(5000 * M));
+        assert_eq!(get(Category::PackageCache), Some(200 * M));
+        assert_eq!(get(Category::VirtualDisks), Some(9000 * M));
+        assert_eq!(get(Category::DriverInstallers), Some(800 * M));
     }
 
     #[test]

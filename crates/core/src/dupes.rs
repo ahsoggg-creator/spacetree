@@ -1,18 +1,19 @@
-//! Duplicate files by content: same size, then same hash of the first bytes, then same hash of the whole file.
+//! Duplicate files by content: same size, then same hash of head+middle+tail samples, then same hash of the whole file.
 //!
 //! Every stage only keeps the files that still have a possible twin, so most files are never read at all
 //! and the rest are read only as far as needed to tell them apart.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 
 use rayon::prelude::*;
 
 use crate::tree::{NodeId, Tree};
 
-/// Bytes hashed in the cheap middle stage.
-const PARTIAL_LEN: usize = 64 << 10;
+/// Bytes hashed at each of the three sample points in the cheap middle stage.
+const SAMPLE_LEN: usize = 16 << 10;
 const BUF_LEN: usize = 1 << 20;
 /// Parallel readers: enough to keep an SSD busy, few enough not to make a spinning disk seek itself to death.
 const READERS: usize = 4;
@@ -63,16 +64,34 @@ impl DupProgress {
     }
 }
 
-/// Reads `limit` bytes (or the whole file) and returns their hash; `None` if the file cannot be read,
-/// is not `size` bytes long any more, or the search was cancelled.
-fn hash_file(path: &str, size: u64, limit: usize, progress: &DupProgress) -> Option<blake3::Hash> {
-    let mut f = File::open(path).ok()?;
-    if f.metadata().ok()?.len() != size {
-        return None;
-    }
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; limit.min(BUF_LEN)];
-    let mut left = limit as u64;
+/// What part of a file is hashed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// Head, middle and tail: containers (video, ISO, PDF) often share an identical header.
+    Sampled,
+    Whole,
+}
+
+/// OneDrive/iCloud-style placeholders: reading them would download the file.
+#[cfg(windows)]
+fn is_cloud_only(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const OFFLINE: u32 = 0x1000;
+    const RECALL_ON_OPEN: u32 = 0x4_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+    meta.file_attributes() & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS) != 0
+}
+
+#[cfg(not(windows))]
+fn is_cloud_only(_: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Feeds `len` bytes starting at `offset` into `hasher`; `None` on a read error or cancellation.
+fn feed(f: &mut File, offset: u64, len: u64, hasher: &mut blake3::Hasher, progress: &DupProgress) -> Option<()> {
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; (len.min(BUF_LEN as u64)) as usize];
+    let mut left = len;
     while left > 0 {
         if progress.is_cancelled() {
             return None;
@@ -86,7 +105,62 @@ fn hash_file(path: &str, size: u64, limit: usize, progress: &DupProgress) -> Opt
         progress.bytes.fetch_add(n as u64, Relaxed);
         left -= n as u64;
     }
+    Some(())
+}
+
+/// Hashes the requested part of a file; `None` if the file cannot be read, is not `size` bytes long any more,
+/// is a cloud placeholder, or the search was cancelled.
+fn hash_file(path: &str, size: u64, part: Part, progress: &DupProgress) -> Option<blake3::Hash> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() != size || is_cloud_only(&meta) {
+        return None;
+    }
+    let mut f = File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    let sample = SAMPLE_LEN as u64;
+    if part == Part::Whole || size <= 3 * sample {
+        feed(&mut f, 0, size, &mut hasher, progress)?;
+    } else {
+        for offset in [0, size / 2 - sample / 2, size - sample] {
+            feed(&mut f, offset, sample, &mut hasher, progress)?;
+        }
+    }
     Some(hasher.finalize())
+}
+
+/// Byte-by-byte comparison; stops at the first difference.
+pub fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
+    let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; BUF_LEN], vec![0u8; BUF_LEN]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Replaces `dup` by a hard link to `keep`: both names stay, one copy of the data remains on disk.
+/// The content is compared again first (the files may have changed since the search). The link is created
+/// beside `dup` and renamed over it, so `dup` is never missing. Same NTFS volume only.
+pub fn replace_with_hardlink(keep: &Path, dup: &Path) -> io::Result<()> {
+    if !same_content(keep, dup)? {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "содержимое файлов изменилось"));
+    }
+    let mut tmp = dup.as_os_str().to_owned();
+    tmp.push(".spacetree-link");
+    let tmp = PathBuf::from(tmp);
+    std::fs::hard_link(keep, &tmp)?;
+    std::fs::rename(&tmp, dup).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Keeps the groups of `keyed` (sorted by key) that have at least two members.
@@ -99,11 +173,11 @@ fn twins<K: PartialEq + Ord + Copy>(mut keyed: Vec<(K, NodeId)>) -> Vec<(K, Vec<
         .collect()
 }
 
-/// Narrows `groups` down by hashing `limit` bytes of each file; returns groups that are still ambiguous.
+/// Narrows `groups` down by hashing `part` of each file; returns groups that are still ambiguous.
 fn refine(
     tree: &Tree,
     groups: Vec<(u64, Vec<NodeId>)>,
-    limit: usize,
+    part: Part,
     stage: u8,
     progress: &DupProgress,
     pool: &rayon::ThreadPool,
@@ -114,7 +188,7 @@ fn refine(
             .par_iter()
             .flat_map_iter(|(size, ids)| ids.iter().map(move |&id| (*size, id)))
             .filter_map(|(size, id)| {
-                let h = hash_file(&tree.path(id), size, limit, progress);
+                let h = hash_file(&tree.path(id), size, part, progress);
                 progress.done.fetch_add(1, Relaxed);
                 h.map(|h| (size, *h.as_bytes(), id))
             })
@@ -137,8 +211,8 @@ pub fn find(tree: &Tree, candidates: &[NodeId], progress: &DupProgress) -> Optio
     progress.done.store(candidates.len() as u64, Relaxed);
 
     let pool = rayon::ThreadPoolBuilder::new().num_threads(READERS).build().ok()?;
-    let partial = refine(tree, by_size, PARTIAL_LEN, STAGE_PARTIAL, progress, &pool);
-    let full = refine(tree, partial, usize::MAX, STAGE_FULL, progress, &pool);
+    let partial = refine(tree, by_size, Part::Sampled, STAGE_PARTIAL, progress, &pool);
+    let full = refine(tree, partial, Part::Whole, STAGE_FULL, progress, &pool);
     if progress.is_cancelled() {
         return None;
     }
@@ -197,6 +271,23 @@ mod tests {
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].items, vec![ids[5], ids[1], ids[0]], "newest first");
         assert_eq!(sets[0].wasted(), 2 * len as u64);
+    }
+
+    #[test]
+    fn hardlink_replaces_copy_only_when_content_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keep, dup, other) = (dir.path().join("k"), dir.path().join("d"), dir.path().join("o"));
+        std::fs::write(&keep, vec![1u8; 3 << 20]).unwrap();
+        std::fs::write(&dup, vec![1u8; 3 << 20]).unwrap();
+        std::fs::write(&other, vec![2u8; 3 << 20]).unwrap();
+
+        assert!(replace_with_hardlink(&keep, &other).is_err());
+        assert_eq!(std::fs::read(&other).unwrap()[0], 2, "mismatching file untouched");
+
+        replace_with_hardlink(&keep, &dup).unwrap();
+        std::fs::write(&keep, b"changed").unwrap();
+        assert_eq!(std::fs::read(&dup).unwrap(), b"changed", "dup now shares the data of keep");
+        assert!(!dir.path().join("d.spacetree-link").exists());
     }
 
     #[test]
