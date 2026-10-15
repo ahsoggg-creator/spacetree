@@ -34,6 +34,7 @@ enum Kind {
     Mp4,
     Sqlite,
     SevenZ,
+    Mkv,
 }
 
 fn signature(b: &[u8]) -> Option<Kind> {
@@ -64,6 +65,8 @@ fn signature(b: &[u8]) -> Option<Kind> {
         Some(Kind::Sqlite)
     } else if b[..6] == [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
         Some(Kind::SevenZ)
+    } else if b[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        Some(Kind::Mkv)
     } else {
         None
     }
@@ -73,12 +76,17 @@ impl Kind {
     /// Longest file of this kind worth looking for.
     fn max_bytes(self) -> u64 {
         match self {
-            Kind::Jpg | Kind::Png => 64 << 20,
-            Kind::Pdf => 256 << 20,
-            Kind::Zip | Kind::SevenZ => 512 << 20,
-            Kind::Bmp | Kind::Riff | Kind::Sqlite => 2 << 30,
-            Kind::Mp4 => 8 << 30,
+            Kind::Jpg | Kind::Png => 256 << 20,
+            Kind::Pdf => 1 << 30,
+            Kind::Zip => 4 << 30,
+            // The length comes from the header, so only the extent limits it (videos can be 100 GB).
+            _ => 1 << 40,
         }
+    }
+
+    /// The header gives the exact length: the file may run past other signatures found inside it.
+    fn sized(self) -> bool {
+        !matches!(self, Kind::Jpg | Kind::Png | Kind::Pdf | Kind::Zip)
     }
 }
 
@@ -267,6 +275,35 @@ fn measure(src: &dyn Source, kind: Kind, lcn: u64, bound: u64) -> Option<(u64, &
             };
             fit(page * be32(28)?).map(|n| (n, "sqlite"))
         }
+        Kind::Mkv => {
+            // EBML header element, then the Segment element whose size covers the rest of the file.
+            let vint = |at: usize| -> Option<(usize, Option<u64>)> {
+                let first = *head.get(at)?;
+                let len = first.leading_zeros() as usize + 1;
+                if len > 8 {
+                    return None;
+                }
+                let mut v = u64::from(first) & (0xFF >> len);
+                let mut all_ones = v == (0xFF >> len);
+                for b in head.get(at + 1..at + len)? {
+                    v = v << 8 | u64::from(*b);
+                    all_ones &= *b == 0xFF;
+                }
+                Some((len, (!all_ones).then_some(v)))
+            };
+            let (l, size) = vint(4)?;
+            let seg = 4 + l + usize::try_from(size?).ok()?;
+            if head.get(seg..seg + 4)? != [0x18, 0x53, 0x80, 0x67] {
+                return None;
+            }
+            let (l2, size2) = vint(seg + 4)?; // None = unknown size (live recording): cannot be measured
+            let ext = if head[..seg].windows(4).any(|w| w == b"webm") {
+                "webm"
+            } else {
+                "mkv"
+            };
+            fit(seg as u64 + 4 + l2 as u64 + size2?).map(|n| (n, ext))
+        }
         Kind::SevenZ => {
             let next = u64::from_le_bytes(head.get(12..20)?.try_into().ok()?);
             let len = u64::from_le_bytes(head.get(20..28)?.try_into().ok()?);
@@ -391,8 +428,12 @@ pub fn carve(drive: char, known: &HashSet<u64>, progress: &Progress) -> Result<V
     progress.phase.store(PHASE_BUILDING, Relaxed);
     let bounds: Vec<u64> = (0..candidates.len())
         .map(|i| {
-            let (lcn, _, ext_end) = candidates[i];
-            let next = candidates.get(i + 1).map_or(ext_end, |n| n.0.min(ext_end));
+            let (lcn, kind, ext_end) = candidates[i];
+            let next = if kind.sized() {
+                ext_end
+            } else {
+                candidates.get(i + 1).map_or(ext_end, |n| n.0.min(ext_end))
+            };
             (next - lcn) * bpc
         })
         .collect();
@@ -409,6 +450,15 @@ pub fn carve(drive: char, known: &HashSet<u64>, progress: &Progress) -> Result<V
         return Err(ScanError::Cancelled);
     }
     found.sort_by_key(|f| f.rec);
+    // A signature inside an already measured file (a cover picture in a video) is part of that file.
+    let mut until = 0;
+    found.retain(|f| {
+        let keep = f.rec >= until;
+        if keep {
+            until = f.rec + f.size.div_ceil(bpc);
+        }
+        keep
+    });
     Ok(found)
 }
 
@@ -513,6 +563,16 @@ mod tests {
         let len = d.len() as u64;
         let m = Mem(padded(d, 4096));
         assert_eq!(measure(&m, Kind::Zip, 0, 4096), Some((len, "docx")));
+    }
+
+    #[test]
+    fn mkv_length_comes_from_the_segment_size() {
+        let mut d = vec![0x1A, 0x45, 0xDF, 0xA3, 0x84, b'w', b'e', b'b', b'm']; // EBML header, 4 bytes of content
+        d.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0, 0, 0, 0, 0, 0x10, 0x00]); // Segment, 8-byte size = 4096
+        let total = d.len() as u64 + 4096;
+        let m = Mem(padded(d, 8192));
+        assert_eq!(signature(&m.0[..32]), Some(Kind::Mkv));
+        assert_eq!(measure(&m, Kind::Mkv, 0, 1 << 20), Some((total, "webm")));
     }
 
     #[test]

@@ -555,6 +555,11 @@ impl App {
             Chance::Partial => (g, p + 1),
             _ => (g, p),
         });
+        let (lost, lost_max) = res
+            .files
+            .iter()
+            .filter(|f| matches!(f.chance, Chance::Lost))
+            .fold((0usize, 0u64), |(n, m), f| (n + 1, m.max(f.size)));
         if res.ssd == Some(true) {
             ui.colored_label(
                 theme::LIKELY,
@@ -581,7 +586,12 @@ impl App {
                 .changed();
             ui.label(
                 RichText::new(format!(
-                    "целых {good}, частично {partial}, всего записей {} (показано {})",
+                    "целых {good}, частично {partial}, перезаписано {lost}{}, всего записей {} (показано {})",
+                    if lost > 0 {
+                        format!(" (самый большой {})", human_size(lost_max))
+                    } else {
+                        String::new()
+                    },
                     res.files.len(),
                     self.recover.view.len()
                 ))
