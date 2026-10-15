@@ -100,6 +100,16 @@ impl App {
                     self.show_settings = !self.show_settings;
                 }
                 self.update_chip(ui);
+                if ui
+                    .button("♻ Восстановление")
+                    .on_hover_text("Найти и восстановить удалённые файлы (NTFS)")
+                    .clicked()
+                {
+                    self.recover.open = !self.recover.open;
+                    if let Some(c) = self.path_text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+                        self.recover.set_drive(c.to_ascii_uppercase());
+                    }
+                }
                 if let Some(data) = self.data.clone() {
                     if ui.button("⬇ CSV").on_hover_text("Экспорт всего дерева в CSV").clicked() {
                         self.export_csv(data);

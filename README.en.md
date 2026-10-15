@@ -29,6 +29,10 @@ per-type statistics, search, and hints about what is safe to delete — plus a h
 - **Safe-to-delete hints:** temp files, browser and app caches, crash dumps, `node_modules` / `target`,
   package-manager caches, old installers, the recycle bin, … with *safe / likely safe / review* levels.
   Tick what you want and delete to the recycle bin or permanently.
+- **Deleted file recovery (NTFS, administrator rights).** The "♻ Восстановление" button scans the MFT for deleted
+  files with names and paths and rates the chance of recovery from the cluster bitmap; "deep search" carves JPG,
+  PNG, PDF, ZIP/Office, MP4 and more by signature in free space. Preview, NTFS-compression support, restoring only
+  to another drive.
 - **Deleting from the app** (`Del` → recycle bin, `Shift+Del` → permanent) with confirmation; the tree and
   statistics update instantly, no rescan.
 - Search by name (`Ctrl+F`), largest files, file types, CSV export, recent paths, arrow-key navigation,

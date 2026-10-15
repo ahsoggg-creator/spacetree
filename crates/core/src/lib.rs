@@ -13,7 +13,11 @@ pub mod tree;
 pub mod walk;
 
 #[cfg(windows)]
+pub mod carve;
+#[cfg(windows)]
 pub mod mft;
+#[cfg(windows)]
+pub mod undelete;
 #[cfg(windows)]
 mod winapi;
 

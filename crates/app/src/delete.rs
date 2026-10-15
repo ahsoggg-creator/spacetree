@@ -1,6 +1,7 @@
 //! Deleting files and folders from the app: confirmation dialog, background worker, tree update.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -27,8 +28,9 @@ pub struct Pending {
 
 pub struct Running {
     rx: Receiver<Outcome>,
-    done: Arc<AtomicUsize>,
-    total: usize,
+    /// Progress in bytes (plus a fixed cost per file, so piles of empty files still move the bar).
+    done: Arc<AtomicU64>,
+    total: u64,
     current: Arc<Mutex<String>>,
     started: Instant,
 }
@@ -52,6 +54,49 @@ pub struct DeleteState {
 impl DeleteState {
     pub fn idle(&self) -> bool {
         self.pending.is_none() && self.running.is_none()
+    }
+}
+
+/// Progress weight of a subtree: its bytes plus a flat cost per file.
+fn weight(size: u64, files: u32) -> u64 {
+    size + u64::from(files.max(1)) * FILE_COST
+}
+
+const FILE_COST: u64 = 4096;
+
+fn remove_file_progress(p: &Path, done: &AtomicU64) -> Result<(), String> {
+    let size = std::fs::symlink_metadata(p).map(|m| m.len()).unwrap_or(0);
+    let r = std::fs::remove_file(p).map_err(|e| e.to_string());
+    if r.is_ok() {
+        done.fetch_add(size + FILE_COST, Relaxed);
+    }
+    r
+}
+
+/// Depth-first removal that keeps going after an error and reports the first one.
+fn remove_dir_progress(dir: &Path, done: &AtomicU64, current: &Mutex<String>) -> Result<(), String> {
+    let mut first_err = None;
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let r = if is_dir {
+                    remove_dir_progress(&path, done, current)
+                } else {
+                    *current.lock().unwrap() = path.to_string_lossy().into_owned();
+                    remove_file_progress(&path, done)
+                };
+                if let Err(e) = r {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        Err(e) => first_err = Some(e.to_string()),
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => first_err.map_or(Ok(()), Err),
+        Err(e) => Err(first_err.unwrap_or_else(|| e.to_string())),
     }
 }
 
@@ -148,7 +193,11 @@ impl App {
         let Some(data) = self.data.clone() else { return };
         let tree = &data.out.tree;
         // (node, path, is the recycle-bin folder whose children go away)
-        let jobs: Vec<(NodeId, String)> = p.ids.iter().map(|&i| (i, tree.path(i))).collect();
+        let jobs: Vec<(NodeId, String, u64)> = p
+            .ids
+            .iter()
+            .map(|&i| (i, tree.path(i), weight(tree.node(i).size, tree.node(i).files)))
+            .collect();
         let keep_paths: Vec<String> = if p.link {
             p.ids.iter().map(|i| tree.path(data.dup_keep[i])).collect()
         } else {
@@ -160,9 +209,9 @@ impl App {
             Vec::new()
         };
         let (tx, rx) = channel();
-        let done = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicU64::new(0));
         let current = Arc::new(Mutex::new(String::new()));
-        let total = jobs.len();
+        let total = jobs.iter().map(|j| j.2).sum::<u64>().max(1);
         let (d2, c2) = (done.clone(), current.clone());
         let (permanent, empty_bin, link) = (p.permanent, p.empty_bin, p.link);
         std::thread::spawn(move || {
@@ -172,13 +221,13 @@ impl App {
                 failed: Vec::new(),
             };
             if link {
-                for ((id, path), keep) in jobs.into_iter().zip(keep_paths) {
+                for ((id, path, w), keep) in jobs.into_iter().zip(keep_paths) {
                     *c2.lock().unwrap() = path.clone();
                     match spacetree_core::dupes::replace_with_hardlink(keep.as_ref(), path.as_ref()) {
                         Ok(()) => out.linked.push(id),
                         Err(e) => out.failed.push((path, e.to_string())),
                     }
-                    d2.fetch_add(1, Relaxed);
+                    d2.fetch_add(w, Relaxed);
                 }
             } else if empty_bin {
                 match winint::empty_recycle_bin() {
@@ -186,14 +235,15 @@ impl App {
                     Err(e) => out.failed.push(("Корзина".into(), e)),
                 }
             } else {
-                for (id, path) in jobs {
+                for (id, path, w) in jobs {
                     *c2.lock().unwrap() = path.clone();
-                    let p = std::path::Path::new(&path);
+                    let p = Path::new(&path);
+                    let before = d2.load(Relaxed);
                     let res = if permanent {
-                        if p.is_dir() {
-                            std::fs::remove_dir_all(p).map_err(|e| e.to_string())
+                        if p.is_dir() && !p.is_symlink() {
+                            remove_dir_progress(p, &d2, &c2)
                         } else {
-                            std::fs::remove_file(p).map_err(|e| e.to_string())
+                            remove_file_progress(p, &d2)
                         }
                     } else {
                         winint::recycle(&path)
@@ -208,7 +258,8 @@ impl App {
                             .unwrap_or_else(|| "удалено не полностью (файлы заняты?)".into());
                         out.failed.push((path, why));
                     }
-                    d2.fetch_add(1, Relaxed);
+                    // The estimate may differ from reality: land exactly on the job's share.
+                    d2.store(before + w, Relaxed);
                 }
             }
             let _ = tx.send(out);
@@ -316,7 +367,9 @@ impl App {
                         ui.add(egui::Spinner::new());
                         ui.label(RichText::new("Удаление…").strong());
                     });
-                    ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).show_percentage());
+                    ui.add(
+                        egui::ProgressBar::new((done as f64 / total.max(1) as f64).min(1.0) as f32).show_percentage(),
+                    );
                     ui.label(RichText::new(current).weak().small());
                 });
             }

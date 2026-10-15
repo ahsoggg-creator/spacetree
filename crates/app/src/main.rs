@@ -6,6 +6,7 @@ mod demo;
 mod diag;
 mod growth;
 mod installer;
+mod recover;
 mod settings;
 mod theme;
 mod treemap;
@@ -249,6 +250,7 @@ pub struct App {
     pub marked: HashSet<NodeId>,
     pub delete: delete::DeleteState,
     pub growth: growth::Growth,
+    pub recover: recover::Recover,
     dup_job: Option<DupJob>,
     /// Search result waiting for the tree to be free (a deletion may hold it).
     dup_pending: Option<Vec<DupSet>>,
@@ -405,6 +407,7 @@ impl App {
             marked: HashSet::new(),
             delete: delete::DeleteState::default(),
             growth: growth::Growth::default(),
+            recover: recover::Recover::default(),
             dup_job: None,
             dup_pending: None,
             demo: None,
@@ -961,6 +964,7 @@ impl App {
             }
         }
         self.delete_dialogs(&ctx);
+        self.recover_window(&ctx);
         self.settings_window(&ctx);
         self.draw_toasts(&ctx);
     }

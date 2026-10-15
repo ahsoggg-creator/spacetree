@@ -48,8 +48,9 @@ pub struct MftOutput {
 }
 
 pub struct VolumeInfo {
-    bytes_per_cluster: u64,
-    record_size: usize,
+    pub(crate) bytes_per_cluster: u64,
+    pub(crate) record_size: usize,
+    pub(crate) total_clusters: u64,
     mft_start_lcn: u64,
 }
 
@@ -87,12 +88,13 @@ pub fn probe(drive: char) -> Result<(File, VolumeInfo), ScanError> {
         VolumeInfo {
             bytes_per_cluster: bpc,
             record_size: rs,
+            total_clusters: v.TotalClusters.max(0) as u64,
             mft_start_lcn: lcn as u64,
         },
     ))
 }
 
-fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
     while !buf.is_empty() {
         let n = file.seek_read(buf, off)?;
         if n == 0 {
@@ -105,7 +107,7 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()
 }
 
 /// Reads `buf.len()` bytes of the $MFT data stream starting at virtual offset `voff`.
-fn read_virtual(file: &File, runs: &[Run], bpc: u64, mut voff: u64, buf: &mut [u8]) -> io::Result<()> {
+pub(crate) fn read_virtual(file: &File, runs: &[Run], bpc: u64, mut voff: u64, buf: &mut [u8]) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
         let vcn = voff / bpc;
@@ -126,7 +128,7 @@ fn read_virtual(file: &File, runs: &[Run], bpc: u64, mut voff: u64, buf: &mut [u
     Ok(())
 }
 
-fn data_extents(attr: &[u8]) -> Result<(Vec<Run>, u64), ScanError> {
+pub(crate) fn data_extents(attr: &[u8]) -> Result<(Vec<Run>, u64), ScanError> {
     if attr[8] == 0 || attr.len() < 0x40 {
         return Err(ScanError::Ntfs("$DATA файла $MFT резидентный".into()));
     }
@@ -142,9 +144,9 @@ fn data_extents(attr: &[u8]) -> Result<(Vec<Run>, u64), ScanError> {
 
 /// Reads record 0 ($MFT itself) and returns the extents of its $DATA stream and its real size.
 /// Extents of `$MFT`'s data, its real size, and the in-use bitmap when it could be read.
-type MftLayout = (Vec<Run>, u64, Option<Vec<u8>>);
+pub(crate) type MftLayout = (Vec<Run>, u64, Option<Vec<u8>>);
 
-fn mft_extents(file: &File, info: &VolumeInfo) -> Result<MftLayout, ScanError> {
+pub(crate) fn mft_extents(file: &File, info: &VolumeInfo) -> Result<MftLayout, ScanError> {
     let bpc = info.bytes_per_cluster;
     let rs = info.record_size;
     let mut block = vec![0u8; rs.max(4096)];

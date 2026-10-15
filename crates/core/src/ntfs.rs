@@ -41,13 +41,13 @@ pub const B_DIR: u8 = 1;
 pub const B_HAS_NAME: u8 = 2;
 pub const B_HAS_DATA: u8 = 4;
 
-fn u16_at(b: &[u8], o: usize) -> u16 {
+pub(crate) fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
-fn u32_at(b: &[u8], o: usize) -> u32 {
+pub(crate) fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
-fn u64_at(b: &[u8], o: usize) -> u64 {
+pub(crate) fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
